@@ -16,7 +16,7 @@ import { setTimeout } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
 import { collectStreamBody, getResponse } from './lib/net-helpers.ts';
-import { defer, ifdescribe, ifit, isWayland, listen, waitUntil } from './lib/spec-helpers.ts';
+import { defer, ifdescribe, ifit, isWayland, listen, spawnAndWait, waitUntil } from './lib/spec-helpers.ts';
 import { runInUtilityProcess } from './lib/utility-process-helpers.ts';
 import { closeWindow, closeAllWindows } from './lib/window-helpers.ts';
 import {
@@ -292,6 +292,30 @@ describe('app module', () => {
         expect(stderr).to.not.match(/Received signal \d+|Ignoring extra certs/, message);
       }
     });
+
+    // A missing display makes toolkit initialisation fail before the main loop
+    // runs; that early return must still tear the JS environment down cleanly.
+    // Skipped under ASan for the same reason as the test above.
+    ifit(process.platform === 'linux' && !process.env.IS_ASAN)(
+      'exits with code 1 when no display is available',
+      async () => {
+        const appPath = path.join(fixturesPath, 'api', 'no-display');
+        const env = { ...process.env };
+        delete env.DISPLAY;
+        delete env.WAYLAND_DISPLAY;
+        appProcess = cp.spawn(process.execPath, [appPath, '--ozone-platform=x11'], { env });
+        let stderr = '';
+        appProcess.stderr!.on('data', (data) => {
+          stderr += data;
+        });
+        const [code, signal] = await once(appProcess, 'close');
+        appProcess = null;
+        const message = `code=${code} signal=${signal}\n${stderr}`;
+        expect(signal).to.equal(null, message);
+        expect(code).to.equal(1, message);
+        expect(stderr).to.not.match(/Received signal \d+|Check failed/, message);
+      }
+    );
 
     ifit(['darwin', 'linux'].includes(process.platform))('exits gracefully', async function () {
       const electronPath = process.execPath;
@@ -1382,22 +1406,28 @@ describe('app module', () => {
         fs.rmSync(tempBrowserDataPath, { force: true, recursive: true });
       });
 
-      it('writes to userData by default', () => {
+      // The app quits once it has written its session data.
+      const runApp = async (args: string[]) => {
+        const { code, stdout, stderr } = await spawnAndWait(process.execPath, [appPath, ...args], { timeout: 20_000 });
+        expect(code).to.equal(0, `stdout:\n${stdout}\nstderr:\n${stderr}`);
+      };
+
+      it('writes to userData by default', async () => {
         expect(hasSessionFiles(userDataPath)).to.equal(false);
-        cp.spawnSync(process.execPath, [appPath]);
+        await runApp([]);
         expect(hasSessionFiles(userDataPath)).to.equal(true);
       });
 
-      it('can be changed', () => {
+      it('can be changed', async () => {
         expect(hasSessionFiles(userDataPath)).to.equal(false);
-        cp.spawnSync(process.execPath, [appPath, 'sessionData', tempBrowserDataPath]);
+        await runApp(['sessionData', tempBrowserDataPath]);
         expect(hasSessionFiles(userDataPath)).to.equal(false);
         expect(hasSessionFiles(tempBrowserDataPath)).to.equal(true);
       });
 
-      it('changing userData affects default sessionData', () => {
+      it('changing userData affects default sessionData', async () => {
         expect(hasSessionFiles(userDataPath)).to.equal(false);
-        cp.spawnSync(process.execPath, [appPath, 'userData', tempBrowserDataPath]);
+        await runApp(['userData', tempBrowserDataPath]);
         expect(hasSessionFiles(userDataPath)).to.equal(false);
         expect(hasSessionFiles(tempBrowserDataPath)).to.equal(true);
       });
