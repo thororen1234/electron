@@ -12,11 +12,17 @@
 #include "base/win/core_winrt_util.h"
 #include "base/win/i18n.h"
 #include "base/win/win_util.h"
+#include "base/win/windows_version.h"
 
 namespace electron {
 
 bool GetPreferredLanguagesUsingGlobalization(
     std::vector<std::wstring>* languages) {
+  // The WinRT APIs used below are delay-loaded and don't exist before
+  // Windows 10; the caller falls back to the MUI APIs.
+  if (base::win::GetVersion() < base::win::Version::WIN10)
+    return false;
+
   base::win::ScopedHString guid = base::win::ScopedHString::Create(
       RuntimeClass_Windows_System_UserProfile_GlobalizationPreferences);
   Microsoft::WRL::ComPtr<

@@ -31,6 +31,7 @@
 #include "base/win/scoped_co_mem.h"
 #include "base/win/scoped_com_initializer.h"
 #include "base/win/shlwapi.h"
+#include "base/win/windows_version.h"
 #include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
 #include "shell/common/electron_paths.h"
@@ -388,9 +389,15 @@ bool MoveItemToTrashWithError(const base::FilePath& path,
   // Elevation prompt enabled for UAC protected files.  This overrides the
   // SILENT, NO_UI and NOERRORUI flags.
 
-  if (FAILED(pfo->SetOperationFlags(
-          FOF_NO_UI | FOFX_ADDUNDORECORD | FOF_NOERRORUI | FOF_SILENT |
-          FOFX_SHOWELEVATIONPROMPT | FOFX_RECYCLEONDELETE))) {
+  // Windows 8 introduced FOFX_RECYCLEONDELETE and deprecated FOF_ALLOWUNDO in
+  // favor of FOFX_ADDUNDORECORD. On Windows 7, recycling is the default.
+  const DWORD flags = base::win::GetVersion() >= base::win::Version::WIN8
+                          ? FOF_NO_UI | FOFX_ADDUNDORECORD | FOF_NOERRORUI |
+                                FOF_SILENT | FOFX_SHOWELEVATIONPROMPT |
+                                FOFX_RECYCLEONDELETE
+                          : FOF_NO_UI | FOF_ALLOWUNDO | FOF_NOERRORUI |
+                                FOF_SILENT | FOFX_SHOWELEVATIONPROMPT;
+  if (FAILED(pfo->SetOperationFlags(flags))) {
     *error = "Failed to set operation flags";
     return false;
   }

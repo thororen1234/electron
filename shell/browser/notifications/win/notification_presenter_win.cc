@@ -16,6 +16,8 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
+#include "base/win/windows_version.h"
+#include "shell/browser/notifications/win/notification_presenter_win7.h"
 #include "shell/browser/notifications/win/windows_toast_activator.h"
 #include "shell/browser/notifications/win/windows_toast_notification.h"
 #include "shell/common/thread_restrictions.h"
@@ -40,6 +42,12 @@ bool SaveIconToPath(const SkBitmap& bitmap, const base::FilePath& path) {
 
 // static
 std::unique_ptr<NotificationPresenter> NotificationPresenter::Create() {
+  // The toast implementation relies on WinRT APIs that only exist on
+  // Windows 10+, so earlier versions use a custom Win32 implementation that
+  // visually resembles the native one.
+  if (base::win::GetVersion() < base::win::Version::WIN10)
+    return std::make_unique<NotificationPresenterWin7>();
+
   if (!WindowsToastNotification::Initialize())
     return {};
   auto presenter = std::make_unique<NotificationPresenterWin>();

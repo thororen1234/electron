@@ -110,6 +110,32 @@ bool IsValidCustomProtocol(const std::wstring& scheme) {
   return cmd_key.Valid() && cmd_key.HasValue(L"URL Protocol");
 }
 
+// ASSOCF_IS_PROTOCOL requires Windows 8, so on Windows 7 read the protocol's
+// registration from the registry instead. Only ASSOCSTR_EXECUTABLE and
+// ASSOCSTR_FRIENDLYAPPNAME are supported.
+std::wstring GetAppInfoForProtocolUsingRegistry(ASSOCSTR assoc_str,
+                                                const std::wstring& scheme) {
+  base::FilePath program;
+  std::wstring command;
+  base::win::RegKey command_key(HKEY_CLASSES_ROOT,
+                                (scheme + L"\\shell\\open\\command").c_str(),
+                                KEY_READ);
+  if (command_key.ReadValue(nullptr, &command) == ERROR_SUCCESS)
+    program = base::CommandLine::FromString(command).GetProgram();
+
+  if (assoc_str == ASSOCSTR_EXECUTABLE)
+    return program.value();
+
+  // Prefer the protocol's display name, falling back to the program's name.
+  std::wstring display_name;
+  base::win::RegKey scheme_key(HKEY_CLASSES_ROOT, scheme.c_str(), KEY_READ);
+  if (scheme_key.ReadValue(nullptr, &display_name) == ERROR_SUCCESS &&
+      !display_name.empty()) {
+    return display_name;
+  }
+  return program.BaseName().value();
+}
+
 // Helper for GetApplicationInfoForProtocol().
 // takes in an assoc_str
 // (https://docs.microsoft.com/en-us/windows/win32/api/shlwapi/ne-shlwapi-assocstr)
@@ -118,6 +144,9 @@ std::wstring GetAppInfoHelperForProtocol(ASSOCSTR assoc_str, const GURL& url) {
   const std::wstring url_scheme = base::ASCIIToWide(url.scheme());
   if (!IsValidCustomProtocol(url_scheme))
     return {};
+
+  if (base::win::GetVersion() < base::win::Version::WIN8)
+    return GetAppInfoForProtocolUsingRegistry(assoc_str, url_scheme);
 
   wchar_t out_buffer[1024];
   DWORD buffer_size = std::size(out_buffer);

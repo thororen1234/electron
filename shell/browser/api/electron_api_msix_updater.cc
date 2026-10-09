@@ -101,8 +101,19 @@ void DebugLog(std::string_view log_msg) {
 
 // Check if the process has a package identity
 bool HasPackageIdentity() {
+  // GetCurrentPackageFullName() requires Windows 8, so resolve it at runtime
+  // to keep the binary loadable on Windows 7, where apps are never packaged.
+  // Every entry point checks this first, which also keeps the WinRT calls
+  // below from running on Windows 7.
+  using GetCurrentPackageFullNameFunc = decltype(&::GetCurrentPackageFullName);
+  static const auto get_current_package_full_name =
+      reinterpret_cast<GetCurrentPackageFullNameFunc>(::GetProcAddress(
+          ::GetModuleHandle(L"kernel32.dll"), "GetCurrentPackageFullName"));
+  if (!get_current_package_full_name)
+    return false;
+
   UINT32 length = 0;
-  LONG rc = GetCurrentPackageFullName(&length, nullptr);
+  LONG rc = get_current_package_full_name(&length, nullptr);
   return rc != APPMODEL_ERROR_NO_PACKAGE;
 }
 

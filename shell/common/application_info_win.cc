@@ -74,10 +74,19 @@ base::win::ScopedHString GetAppUserModelID() {
 }
 
 bool IsRunningInDesktopBridgeImpl() {
+  // GetPackageFamilyName() requires Windows 8, so resolve it at runtime to
+  // keep the binary loadable on Windows 7, where apps are never packaged.
+  using GetPackageFamilyNameFunc = decltype(&::GetPackageFamilyName);
+  static const auto get_package_family_name =
+      reinterpret_cast<GetPackageFamilyNameFunc>(::GetProcAddress(
+          ::GetModuleHandle(L"kernel32.dll"), "GetPackageFamilyName"));
+  if (!get_package_family_name)
+    return false;
+
   UINT32 length = PACKAGE_FAMILY_NAME_MAX_LENGTH;
   wchar_t packageFamilyName[PACKAGE_FAMILY_NAME_MAX_LENGTH];
   HANDLE proc = GetCurrentProcess();
-  LONG result = GetPackageFamilyName(proc, &length, packageFamilyName);
+  LONG result = get_package_family_name(proc, &length, packageFamilyName);
   return result == ERROR_SUCCESS;
 }
 
