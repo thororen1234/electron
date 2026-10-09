@@ -33,6 +33,7 @@
 #include "electron/fuses.h"
 #include "sandbox/win/src/sandbox_types.h"
 #include "shell/app/command_line_args.h"
+#include "shell/app/electron_delay_load_hook_win.h"
 #include "shell/app/electron_main_delegate.h"
 #include "shell/app/node_main.h"
 #include "shell/common/electron_command_line.h"
@@ -90,6 +91,9 @@ void WINAPI FiberBinder(void* params) {
 #endif  // defined(ARCH_CPU_32_BITS)
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, wchar_t* cmd, int) {
+  // This must run before any delay-loaded function is called.
+  electron::InstallLegacyWindowsDelayLoadFallbacks();
+
 #if defined(ARCH_CPU_32_BITS)
   enum class FiberStatus { kConvertFailed, kCreateFiberFailed, kSuccess };
   FiberStatus fiber_status = FiberStatus::kSuccess;

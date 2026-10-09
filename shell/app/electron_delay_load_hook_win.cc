@@ -6,18 +6,20 @@
 // exist on newer versions of Windows.
 //
 // Chromium delay-loads many Windows 8+ APIs and calls them without checking
-// the OS version. When one of them can't be resolved, the delay-load helper
-// calls the failure hook below, which returns a fallback with the same
-// signature: a Windows 7 equivalent where one exists, or a result that callers
-// already handle as "not supported". Anything without a fallback still fails
-// the usual way, after logging its name with OutputDebugString.
+// the OS version. Before Windows 10, a delay-load notification callback
+// resolves each DLL and function itself: a DLL that doesn't exist is replaced
+// by kernel32, and a function that doesn't exist is replaced by a fallback
+// with the same signature, either a Windows 7 equivalent or a result that
+// callers already handle as "not supported". Anything without a fallback
+// still fails the usual way, after logging its name with OutputDebugString.
+
+#include "shell/app/electron_delay_load_hook_win.h"
 
 #include <windows.h>
 
 #include <combaseapi.h>
 #include <d3d12.h>
 #include <dcomp.h>
-#include <delayimp.h>
 #include <dxgi1_3.h>
 #include <evntprov.h>
 #include <mfapi.h>
@@ -30,6 +32,8 @@
 #include <winstring.h>
 
 #include <string_view>
+
+#include "chrome/common/win/delay_load_notify_hook.h"
 
 namespace {
 
@@ -313,29 +317,37 @@ FARPROC FindFallback(const char* name) {
   return nullptr;
 }
 
-void LogMissing(const char* what, const char* dll, const char* name) {
+void LogMissing(const char* dll, const char* name) {
   char message[256];
-  ::wsprintfA(message, "Electron: no Windows 7 fallback for %s %s!%s\n", what,
+  ::wsprintfA(message, "Electron: no Windows 7 fallback for %s!%s\n",
               dll ? dll : "?", name ? name : "?");
   ::OutputDebugStringA(message);
 }
 
-FARPROC WINAPI DelayLoadFailureHook(unsigned reason, DelayLoadInfo* info) {
-  switch (reason) {
-    case dliFailLoadLib:
-      // The DLL doesn't exist on this version of Windows (e.g. dcomp.dll or an
-      // API set). Hand back kernel32 so that resolving each function fails and
-      // comes back here for a fallback.
-      return reinterpret_cast<FARPROC>(::GetModuleHandleW(L"kernel32.dll"));
+FARPROC DelayLoadCallback(unsigned delay_load_event, DelayLoadInfo* info) {
+  switch (delay_load_event) {
+    case dliNotePreLoadLibrary: {
+      // Load the DLL the same way the delay-load helper does. If it doesn't
+      // exist on this version of Windows (e.g. dcomp.dll or an API set), use
+      // kernel32 so that each function falls back below.
+      HMODULE module = ::LoadLibraryExA(info->szDll, nullptr, 0);
+      if (!module) {
+        module = ::GetModuleHandleW(L"kernel32.dll");
+      }
+      return reinterpret_cast<FARPROC>(module);
+    }
 
-    case dliFailGetProc: {
+    case dliNotePreGetProcAddress: {
       if (!info->dlp.fImportByName) {
-        LogMissing("ordinal in", info->szDll, "?");
-        return nullptr;
+        return nullptr;  // Let the helper resolve ordinals.
+      }
+      if (FARPROC function =
+              ::GetProcAddress(info->hmodCur, info->dlp.szProcName)) {
+        return function;
       }
       FARPROC fallback = FindFallback(info->dlp.szProcName);
       if (!fallback) {
-        LogMissing("function", info->szDll, info->dlp.szProcName);
+        LogMissing(info->szDll, info->dlp.szProcName);
       }
       return fallback;
     }
@@ -345,9 +357,25 @@ FARPROC WINAPI DelayLoadFailureHook(unsigned reason, DelayLoadInfo* info) {
   }
 }
 
+bool IsBeforeWindows10() {
+  // RtlGetVersion isn't affected by the executable's compatibility manifest.
+  using RtlGetVersionFunc = LONG(WINAPI*)(OSVERSIONINFOEXW*);
+  const auto rtl_get_version = reinterpret_cast<RtlGetVersionFunc>(
+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+  OSVERSIONINFOEXW version = {};
+  version.dwOSVersionInfoSize = sizeof(version);
+  return rtl_get_version && rtl_get_version(&version) == 0 &&
+         version.dwMajorVersion < 10;
+}
+
 }  // namespace
 
-// The delay-load helper in delayimp.lib calls this when a delay-loaded DLL or
-// function can't be resolved. This must have external linkage so that it
-// replaces the default in delayimp.lib at link time.
-extern "C" const PfnDliHook __pfnDliFailureHook2 = DelayLoadFailureHook;
+namespace electron {
+
+void InstallLegacyWindowsDelayLoadFallbacks() {
+  if (IsBeforeWindows10()) {
+    SetDelayLoadHookCallback(&DelayLoadCallback);
+  }
+}
+
+}  // namespace electron

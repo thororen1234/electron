@@ -1638,10 +1638,13 @@ if (is_mac) {
   }
 
   if (is_win) {
-    # Provides Windows 7 fallbacks for delay-loaded Windows 8+ functions. This
-    # must be a source_set so that its hook replaces the one in delayimp.lib.
+    # Provides Windows 7 fallbacks for delay-loaded Windows 8+ functions.
     source_set("electron_delay_load_hook") {
-      sources = [ "shell/app/electron_delay_load_hook_win.cc" ]
+      sources = [
+        "shell/app/electron_delay_load_hook_win.cc",
+        "shell/app/electron_delay_load_hook_win.h",
+      ]
+      deps = [ "//chrome/common/win:delay_load_hooks" ]
       libs = [ "powrprof.lib" ]
     }
   }
