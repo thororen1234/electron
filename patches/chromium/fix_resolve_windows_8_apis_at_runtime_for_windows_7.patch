@@ -1,0 +1,603 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:55:16 -0400
+Subject: fix: resolve Windows 8+ APIs at runtime for Windows 7
+
+Chromium imports several Windows 8+ functions directly, which prevents
+the binary from loading on Windows 7, and CHECKs that ProcessPrng (a
+Windows 10 export) exists. Resolve these at runtime instead and fall
+back to the Windows 7 equivalent, or to the existing failure path:
+
+* GetSystemTimePreciseAsFileTime -> GetSystemTimeAsFileTime
+* QueryUnbiasedInterruptTimePrecise -> QueryUnbiasedInterruptTime
+* DiscardVirtualMemory -> the existing MEM_RESET fallback
+* PrefetchVirtualMemory, Get/SetProcessInformation,
+  Get/SetProcessMitigationPolicy, SetThreadInformation,
+  EventSetInformation and the package APIs -> report unsupported
+* ProcessPrng -> RtlGenRandom (advapi32!SystemFunction036)
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h b/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h
+index 5861af19498944249a5a07d612d2826bc0d6633c..666322ff2775d409d23e630bfb8d261d7cbe9c17 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/page_allocator_internals_win.h
+@@ -235,8 +235,12 @@ bool TryRecommitSystemPagesInternal(
+ void DiscardSystemPagesInternal(uintptr_t address, size_t length) {
+   void* ptr = reinterpret_cast<void*>(address);
+   // Use DiscardVirtualMemory when available because it releases faster than
+-  // MEM_RESET.
+-  DWORD ret = DiscardVirtualMemory(ptr, length);
++  // MEM_RESET. It requires Windows 8.1, so it's resolved at runtime.
++  static const auto discard_virtual_memory =
++      reinterpret_cast<decltype(&::DiscardVirtualMemory)>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "DiscardVirtualMemory"));
++  DWORD ret = discard_virtual_memory ? discard_virtual_memory(ptr, length)
++                                     : ERROR_NOT_SUPPORTED;
+   // DiscardVirtualMemory is buggy in Win10 SP0, so fall back to MEM_RESET on
+   // failure.
+   if (ret) {
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
+index 1596bc2a31a29fd1fb08e8d6491253b04b1a5aaa..23f6f23f62779141b97caf21ec477165b9d0cc43 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
+@@ -21,6 +21,31 @@ BOOL WINAPI ProcessPrng(PBYTE pbData, SIZE_T cbData);
+ 
+ namespace partition_alloc::internal::base {
+ 
++namespace {
++
++// ProcessPrng() requires Windows 10. Fall back to RtlGenRandom, exported by
++// advapi32 as SystemFunction036, which has a narrower signature.
++BOOL WINAPI RtlGenRandomFallback(PBYTE pbData, SIZE_T cbData) {
++  using RtlGenRandomFunc = BOOLEAN(WINAPI*)(PVOID, ULONG);
++  static const auto rtl_gen_random = reinterpret_cast<RtlGenRandomFunc>(
++      ::GetProcAddress(::LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
++  if (!rtl_gen_random) {
++    return FALSE;
++  }
++  while (cbData > 0) {
++    const ULONG chunk =
++        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
++    if (!rtl_gen_random(pbData, chunk)) {
++      return FALSE;
++    }
++    pbData += chunk;
++    cbData -= chunk;
++  }
++  return TRUE;
++}
++
++}  // namespace
++
+ void RandBytes(void* output, size_t output_length) {
+   // Import bcryptprimitives directly rather than cryptbase to avoid opening a
+   // handle to \\Device\KsecDD in the renderer.
+@@ -33,7 +58,9 @@ void RandBytes(void* output, size_t output_length) {
+     PA_BASE_CHECK(hmod);
+     process_prng_fn = reinterpret_cast<decltype(&ProcessPrng)>(
+         GetProcAddress(hmod, "ProcessPrng"));
+-    PA_BASE_CHECK(process_prng_fn);
++    if (!process_prng_fn) {
++      process_prng_fn = &RtlGenRandomFallback;
++    }
+   }
+   BOOL success = process_prng_fn(static_cast<BYTE*>(output), output_length);
+   // ProcessPrng is documented to always return TRUE.
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc
+index bf37a99c7617246c759ada906df05f709a5cd434..bd911cf5492bf3f225d22a4b5f44f237de2df079 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/time/time_win.cc
+@@ -77,8 +77,17 @@ FILETIME MicrosecondsToFileTime(int64_t us) {
+ }
+ 
+ int64_t CurrentWallclockMicroseconds() {
++  // GetSystemTimePreciseAsFileTime() requires Windows 8.
++  static const auto get_system_time =
++      reinterpret_cast<decltype(&::GetSystemTimePreciseAsFileTime)>(
++          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                           "GetSystemTimePreciseAsFileTime"));
+   FILETIME ft;
+-  ::GetSystemTimePreciseAsFileTime(&ft);
++  if (get_system_time) {
++    get_system_time(&ft);
++  } else {
++    ::GetSystemTimeAsFileTime(&ft);
++  }
+   return FileTimeToMicroseconds(ft);
+ }
+ 
+diff --git a/base/files/file_util_win.cc b/base/files/file_util_win.cc
+index f9f25a6522d4ddccd149018072a6699b539a5294..6362513d20bbf5b8356620f2efe975db9e3410f3 100644
+--- a/base/files/file_util_win.cc
++++ b/base/files/file_util_win.cc
+@@ -1503,7 +1503,14 @@ bool PreReadFile(const FilePath& file_path,
+   // simple data file read, more from a RAM perspective than CPU. This is
+   // because reading the file as data results in double mapping to
+   // Image/executable pages for all pages of code executed.
+-  return ::PrefetchVirtualMemory(::GetCurrentProcess(),
++  // PrefetchVirtualMemory() requires Windows 8.
++  static const auto prefetch_virtual_memory =
++      reinterpret_cast<decltype(&::PrefetchVirtualMemory)>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory"));
++  if (!prefetch_virtual_memory) {
++    return false;
++  }
++  return prefetch_virtual_memory(::GetCurrentProcess(),
+                                  /*NumberOfEntries=*/1, &address_range,
+                                  /*Flags=*/0);
+ }
+diff --git a/base/memory/discardable_shared_memory.cc b/base/memory/discardable_shared_memory.cc
+index b44515c9baa976f80d6414b03bb0e628534dfdc5..a3879d9a9000c7bb4c9916ed9e58731e1a35e6c8 100644
+--- a/base/memory/discardable_shared_memory.cc
++++ b/base/memory/discardable_shared_memory.cc
+@@ -439,7 +439,12 @@ bool DiscardableSharedMemory::Purge(Time current_time) {
+   uint8_t* address = mapped.data();
+   size_t length = AlignToPageSize(mapped.size());
+ 
+-  DWORD ret = DiscardVirtualMemory(address, length);
++  // DiscardVirtualMemory() requires Windows 8.1, so it's resolved at runtime.
++  static const auto discard_virtual_memory =
++      reinterpret_cast<decltype(&::DiscardVirtualMemory)>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "DiscardVirtualMemory"));
++  DWORD ret = discard_virtual_memory ? discard_virtual_memory(address, length)
++                                     : ERROR_NOT_SUPPORTED;
+   // DiscardVirtualMemory is buggy in Win10 SP0, so fall back to MEM_RESET on
+   // failure.
+   if (ret != ERROR_SUCCESS) {
+diff --git a/base/rand_util_win.cc b/base/rand_util_win.cc
+index bf9a489b95f2eb4ffd43c900eeb7d3c2e3fe8b08..6b06571d4657d3ba339b923045bdcf33b6d8dfdf 100644
+--- a/base/rand_util_win.cc
++++ b/base/rand_util_win.cc
+@@ -50,6 +50,28 @@ bool UseBoringSSLForRandBytes() {
+ 
+ namespace {
+ 
++
++// ProcessPrng() requires Windows 10. Fall back to RtlGenRandom, exported by
++// advapi32 as SystemFunction036, which has a narrower signature.
++BOOL WINAPI RtlGenRandomFallback(PBYTE pbData, SIZE_T cbData) {
++  using RtlGenRandomFunc = BOOLEAN(WINAPI*)(PVOID, ULONG);
++  static const auto rtl_gen_random = reinterpret_cast<RtlGenRandomFunc>(
++      ::GetProcAddress(::LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
++  if (!rtl_gen_random) {
++    return FALSE;
++  }
++  while (cbData > 0) {
++    const ULONG chunk =
++        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
++    if (!rtl_gen_random(pbData, chunk)) {
++      return FALSE;
++    }
++    pbData += chunk;
++    cbData -= chunk;
++  }
++  return TRUE;
++}
++
+ // Import bcryptprimitives!ProcessPrng rather than cryptbase!RtlGenRandom to
+ // avoid opening a handle to \\Device\KsecDD in the renderer.
+ decltype(&ProcessPrng) GetProcessPrng() {
+@@ -58,7 +80,9 @@ decltype(&ProcessPrng) GetProcessPrng() {
+   decltype(&ProcessPrng) process_prng_fn =
+       reinterpret_cast<decltype(&ProcessPrng)>(
+           GetProcAddress(hmod, "ProcessPrng"));
+-  CHECK(process_prng_fn);
++  if (!process_prng_fn) {
++    process_prng_fn = &RtlGenRandomFallback;
++  }
+   return process_prng_fn;
+ }
+ 
+diff --git a/base/threading/platform_thread_win.cc b/base/threading/platform_thread_win.cc
+index 6f9a4d2c753d024fd25aacfe573d239a78d1b7c1..b48748addca8cbd71f17a940602742dbcf503851 100644
+--- a/base/threading/platform_thread_win.cc
++++ b/base/threading/platform_thread_win.cc
+@@ -351,6 +351,21 @@ bool PlatformThread::CanChangeThreadType(ThreadType from, ThreadType to) {
+ 
+ namespace {
+ 
++// SetThreadInformation() requires Windows 8.
++BOOL SetThreadInformationIfAvailable(HANDLE thread,
++                                     THREAD_INFORMATION_CLASS info_class,
++                                     LPVOID info,
++                                     DWORD info_size) {
++  static const auto set_thread_information =
++      reinterpret_cast<decltype(&::SetThreadInformation)>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation"));
++  if (!set_thread_information) {
++    ::SetLastError(ERROR_NOT_SUPPORTED);
++    return FALSE;
++  }
++  return set_thread_information(thread, info_class, info, info_size);
++}
++
+ void SetThreadPriority(PlatformThreadHandle thread_handle,
+                        ThreadType thread_type) {
+   PlatformThreadHandle::Handle platform_handle =
+@@ -404,9 +419,11 @@ void SetThreadPriority(PlatformThreadHandle thread_handle,
+     MEMORY_PRIORITY_INFORMATION memory_priority{.MemoryPriority =
+                                                     MEMORY_PRIORITY_NORMAL};
+     [[maybe_unused]] const BOOL memory_priority_success =
+-        SetThreadInformation(platform_handle, ::ThreadMemoryPriority,
+-                             &memory_priority, sizeof(memory_priority));
+-    DPLOG_IF(ERROR, !memory_priority_success)
++        SetThreadInformationIfAvailable(platform_handle, ::ThreadMemoryPriority,
++                                        &memory_priority,
++                                        sizeof(memory_priority));
++    DPLOG_IF(ERROR, !memory_priority_success &&
++                        win::GetVersion() >= win::Version::WIN8)
+         << "Set thread memory priority failed.";
+ 
+     // In a background process, THREAD_MODE_BACKGROUND_BEGIN lowers the memory
+@@ -446,7 +463,7 @@ void SetThreadQualityOfService(PlatformThreadHandle thread_handle,
+       .StateMask =
+           desire_ecoqos ? THREAD_POWER_THROTTLING_EXECUTION_SPEED : 0ul,
+   };
+-  [[maybe_unused]] const BOOL success = ::SetThreadInformation(
++  [[maybe_unused]] const BOOL success = SetThreadInformationIfAvailable(
+       thread_handle.platform_handle(), ::ThreadPowerThrottling,
+       &thread_power_throttling_state, sizeof(thread_power_throttling_state));
+   // Failure is expected on versions of Windows prior to RS3.
+diff --git a/base/time/time_win.cc b/base/time/time_win.cc
+index fcdcb8191ab73dd636a9376b6e82e13de767806d..8f1ce06a4dd23af50000d88c3686ffc164350c7e 100644
+--- a/base/time/time_win.cc
++++ b/base/time/time_win.cc
+@@ -52,6 +52,7 @@
+ #include "base/synchronization/lock.h"
+ #include "base/threading/platform_thread.h"
+ #include "base/time/time_override.h"
++#include "base/win/windows_version.h"
+ #include "build/build_config.h"
+ 
+ namespace base {
+@@ -81,8 +82,17 @@ FILETIME MicrosecondsToFileTime(int64_t us) {
+ }
+ 
+ int64_t CurrentWallclockMicroseconds() {
++  // GetSystemTimePreciseAsFileTime() requires Windows 8.
++  static const auto get_system_time =
++      reinterpret_cast<decltype(&::GetSystemTimePreciseAsFileTime)>(
++          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                           "GetSystemTimePreciseAsFileTime"));
+   FILETIME ft;
+-  ::GetSystemTimePreciseAsFileTime(&ft);
++  if (get_system_time) {
++    get_system_time(&ft);
++  } else {
++    ::GetSystemTimeAsFileTime(&ft);
++  }
+   return FileTimeToMicroseconds(ft);
+ }
+ 
+@@ -756,8 +766,16 @@ TimeTicks::Clock TimeTicks::GetClock() {
+ 
+ namespace subtle {
+ LiveTicks LiveTicksNowIgnoringOverride() {
++  // QueryUnbiasedInterruptTimePrecise() requires Windows 10 and is
++  // delay-loaded, so fall back to the less precise Windows 7 API.
++  static const bool has_precise =
++      base::win::GetVersion() >= base::win::Version::WIN10;
+   ULONGLONG unbiased_interrupt_time;
+-  QueryUnbiasedInterruptTimePrecise(&unbiased_interrupt_time);
++  if (has_precise) {
++    QueryUnbiasedInterruptTimePrecise(&unbiased_interrupt_time);
++  } else {
++    ::QueryUnbiasedInterruptTime(&unbiased_interrupt_time);
++  }
+   // QueryUnbiasedInterruptTimePrecise gets the interrupt time in system time
+   // units of 100 nanoseconds.
+   return LiveTicks() + Nanoseconds(unbiased_interrupt_time * 100);
+diff --git a/base/trace_event/trace_logging_minimal_win.cc b/base/trace_event/trace_logging_minimal_win.cc
+index b376c6c0d766041e8e5ffe9ea6b53d765ba048b2..60297df777af572b87d287ee80b725786f65755e 100644
+--- a/base/trace_event/trace_logging_minimal_win.cc
++++ b/base/trace_event/trace_logging_minimal_win.cc
+@@ -87,8 +87,14 @@ ULONG TlmProvider::Register(const char* provider_name,
+     return status;
+   }
+ 
+-  // Best-effort, ignore failure.
+-  return ::EventSetInformation(reg_handle_, EventProviderSetTraits,
++  // Best-effort, ignore failure. EventSetInformation() requires Windows 8.
++  static const auto event_set_information =
++      reinterpret_cast<decltype(&::EventSetInformation)>(::GetProcAddress(
++          ::GetModuleHandleW(L"advapi32.dll"), "EventSetInformation"));
++  if (!event_set_information) {
++    return ERROR_SUCCESS;
++  }
++  return event_set_information(reg_handle_, EventProviderSetTraits,
+                                provider_metadata_, provider_metadata_size_);
+ }
+ 
+diff --git a/base/win/win_util.cc b/base/win/win_util.cc
+index 1933efeb0db05f168a8d285c3c9921550ab654da..252afc3b7a6db5224d065530a316a42d74e1d9c8 100644
+--- a/base/win/win_util.cc
++++ b/base/win/win_util.cc
+@@ -374,14 +374,38 @@ bool IsWindows11TabletMode() {
+          IsValidTabletDisplayConfig();
+ }
+ 
++// GetProcessInformation() and SetProcessInformation() require Windows 8.
++BOOL GetProcessInformationIfAvailable(HANDLE process,
++                                      PROCESS_INFORMATION_CLASS info_class,
++                                      LPVOID info,
++                                      DWORD info_size) {
++  static const auto get_process_information =
++      reinterpret_cast<decltype(&::GetProcessInformation)>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "GetProcessInformation"));
++  return get_process_information &&
++         get_process_information(process, info_class, info, info_size);
++}
++
++BOOL SetProcessInformationIfAvailable(HANDLE process,
++                                      PROCESS_INFORMATION_CLASS info_class,
++                                      LPVOID info,
++                                      DWORD info_size) {
++  static const auto set_process_information =
++      reinterpret_cast<decltype(&::SetProcessInformation)>(::GetProcAddress(
++          ::GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"));
++  return set_process_information &&
++         set_process_information(process, info_class, info, info_size);
++}
++
+ // Helper for getting the process power throttling state.
+ ProcessPowerState GetProcessPowerThrottlingState(HANDLE process, ULONG flag) {
+   // Get the current explicitly set state of the process power throttling.
+   PROCESS_POWER_THROTTLING_STATE power_throttling{
+       .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION};
+ 
+-  if (!::GetProcessInformation(process, ProcessPowerThrottling,
+-                               &power_throttling, sizeof(power_throttling))) {
++  if (!GetProcessInformationIfAvailable(process, ProcessPowerThrottling,
++                                        &power_throttling,
++                                        sizeof(power_throttling))) {
+     return ProcessPowerState::kUnset;
+   }
+ 
+@@ -412,8 +436,9 @@ bool SetProcessPowerThrottlingState(HANDLE process,
+ 
+   // Get the current state of the process power throttling so we do not clobber
+   // other previously set flags.
+-  if (!::GetProcessInformation(process, ProcessPowerThrottling,
+-                               &power_throttling, sizeof(power_throttling))) {
++  if (!GetProcessInformationIfAvailable(process, ProcessPowerThrottling,
++                                        &power_throttling,
++                                        sizeof(power_throttling))) {
+     return false;
+   }
+ 
+@@ -438,8 +463,9 @@ bool SetProcessPowerThrottlingState(HANDLE process,
+       break;
+   }
+ 
+-  return ::SetProcessInformation(process, ProcessPowerThrottling,
+-                                 &power_throttling, sizeof(power_throttling));
++  return SetProcessInformationIfAvailable(process, ProcessPowerThrottling,
++                                          &power_throttling,
++                                          sizeof(power_throttling));
+ }
+ 
+ }  // namespace
+@@ -959,10 +985,17 @@ bool IsDeviceJoinedToAzureAD() {
+ bool IsUser32AndGdi32Available() {
+   static const bool is_user32_and_gdi32_available = [] {
+     // If win32k syscalls aren't disabled, then user32 and gdi32 are available.
++    // GetProcessMitigationPolicy() requires Windows 8; win32k lockdown
++    // doesn't exist before that.
++    static const auto get_process_mitigation_policy =
++        reinterpret_cast<decltype(&::GetProcessMitigationPolicy)>(
++            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                             "GetProcessMitigationPolicy"));
+     PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY policy = {};
+-    if (::GetProcessMitigationPolicy(::GetCurrentProcess(),
+-                                     ProcessSystemCallDisablePolicy, &policy,
+-                                     sizeof(policy))) {
++    if (get_process_mitigation_policy &&
++        get_process_mitigation_policy(::GetCurrentProcess(),
++                                      ProcessSystemCallDisablePolicy, &policy,
++                                      sizeof(policy))) {
+       return policy.DisallowWin32kSystemCalls == 0;
+     }
+ 
+@@ -1282,8 +1315,14 @@ bool EnableStrictHandleCheckingForCurrentProcess() {
+   policy.HandleExceptionsPermanentlyEnabled =
+       policy.RaiseExceptionOnInvalidHandleReference = true;
+ 
+-  return ::SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &policy,
+-                                      sizeof(policy));
++  // SetProcessMitigationPolicy() requires Windows 8.
++  static const auto set_process_mitigation_policy =
++      reinterpret_cast<decltype(&::SetProcessMitigationPolicy)>(
++          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                           "SetProcessMitigationPolicy"));
++  return set_process_mitigation_policy &&
++         set_process_mitigation_policy(ProcessStrictHandleCheckPolicy,
++                                       &policy, sizeof(policy));
+ }
+ 
+ ScopedDomainStateForTesting::ScopedDomainStateForTesting(bool state)
+diff --git a/media/base/win/media_foundation_package_locator_helper.cc b/media/base/win/media_foundation_package_locator_helper.cc
+index 5e1806f6e5db9376403ed4f60ccc79bee72aad72..dd91e350fd080742323a884b8b20f3fbed019f20 100644
+--- a/media/base/win/media_foundation_package_locator_helper.cc
++++ b/media/base/win/media_foundation_package_locator_helper.cc
+@@ -31,15 +31,29 @@ std::vector<base::FilePath> MediaFoundationPackageInstallPaths(
+     std::wstring_view decoder_lib_name,
+     MediaFoundationCodecPackage codec_package) {
+   std::vector<base::FilePath> package_paths;  // Collected paths to return.
++
++  // The package APIs require Windows 8, and there are no packages before that.
++  static const auto get_packages_by_package_family =
++      reinterpret_cast<decltype(&::GetPackagesByPackageFamily)>(
++          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                           "GetPackagesByPackageFamily"));
++  static const auto get_package_path_by_full_name =
++      reinterpret_cast<decltype(&::GetPackagePathByFullName)>(
++          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                           "GetPackagePathByFullName"));
++  if (!get_packages_by_package_family || !get_package_path_by_full_name) {
++    return package_paths;
++  }
++
+   for (const auto& package_family_name : package_family_names) {
+     // Loop for each package family name.
+     DVLOG(2) << __func__ << ": Use package_family_name=" << package_family_name;
+ 
+     uint32_t package_count = 0;
+     uint32_t buffer_size = 0;
+-    long rc =
+-        GetPackagesByPackageFamily(package_family_name.data(), &package_count,
+-                                   nullptr, &buffer_size, nullptr);
++    long rc = get_packages_by_package_family(
++        package_family_name.data(), &package_count, nullptr, &buffer_size,
++        nullptr);
+     if ((rc != ERROR_SUCCESS && rc != ERROR_INSUFFICIENT_BUFFER) ||
+         package_count == 0) {
+       DVLOG(2) << package_family_name
+@@ -51,9 +65,9 @@ std::vector<base::FilePath> MediaFoundationPackageInstallPaths(
+     // Allocate required sizes to get all the package fullnames.
+     std::vector<wchar_t> buffer(buffer_size);
+     std::vector<wchar_t*> package_full_names(package_count);
+-    rc = GetPackagesByPackageFamily(package_family_name.data(), &package_count,
+-                                    package_full_names.data(), &buffer_size,
+-                                    buffer.data());
++    rc = get_packages_by_package_family(
++        package_family_name.data(), &package_count, package_full_names.data(),
++        &buffer_size, buffer.data());
+     if (package_count == 0) {
+       DLOG(WARNING) << "Cannot find " << package_family_name << ". rc=" << rc;
+       return package_paths;
+@@ -64,8 +78,8 @@ std::vector<base::FilePath> MediaFoundationPackageInstallPaths(
+     for (const wchar_t* package_full_name : package_full_names) {
+       DVLOG(2) << __func__ << ": package_full_name=" << package_full_name;
+       uint32_t package_path_len = std::size(package_path);
+-      rc = GetPackagePathByFullName(package_full_name, &package_path_len,
+-                                    package_path);
++      rc = get_package_path_by_full_name(package_full_name,
++                                         &package_path_len, package_path);
+       if (rc != ERROR_SUCCESS) {
+         DLOG(WARNING) << "Cannot find " << package_full_name << ". rc=" << rc;
+         package_paths.clear();
+diff --git a/sandbox/win/src/win_utils.cc b/sandbox/win/src/win_utils.cc
+index fc425d23651e5c2300f897c539e9912904ffe2b0..6c070603c950414b9889e20d8e307ff8ebe1b8ee 100644
+--- a/sandbox/win/src/win_utils.cc
++++ b/sandbox/win/src/win_utils.cc
+@@ -74,6 +74,28 @@ std::unique_ptr<std::vector<uint8_t>> QueryObjectInformation(
+   return data;
+ }
+ 
++
++// ProcessPrng() requires Windows 10. Fall back to RtlGenRandom, exported by
++// advapi32 as SystemFunction036, which has a narrower signature.
++BOOL WINAPI RtlGenRandomFallback(PBYTE pbData, SIZE_T cbData) {
++  using RtlGenRandomFunc = BOOLEAN(WINAPI*)(PVOID, ULONG);
++  static const auto rtl_gen_random = reinterpret_cast<RtlGenRandomFunc>(
++      ::GetProcAddress(::LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
++  if (!rtl_gen_random) {
++    return FALSE;
++  }
++  while (cbData > 0) {
++    const ULONG chunk =
++        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
++    if (!rtl_gen_random(pbData, chunk)) {
++      return FALSE;
++    }
++    pbData += chunk;
++    cbData -= chunk;
++  }
++  return TRUE;
++}
++
+ // Import bcryptprimitives!ProcessPrng rather than cryptbase!RtlGenRandom to
+ // avoid opening a handle to \\Device\KsecDD in the renderer.
+ decltype(&ProcessPrng) GetProcessPrng() {
+@@ -82,7 +104,9 @@ decltype(&ProcessPrng) GetProcessPrng() {
+   decltype(&ProcessPrng) process_prng_fn =
+       reinterpret_cast<decltype(&ProcessPrng)>(
+           GetProcAddress(hmod, "ProcessPrng"));
+-  CHECK(process_prng_fn);
++  if (!process_prng_fn) {
++    process_prng_fn = &RtlGenRandomFallback;
++  }
+   return process_prng_fn;
+ }
+ 
+diff --git a/services/webnn/public/cpp/platform_functions_win.cc b/services/webnn/public/cpp/platform_functions_win.cc
+index e8a27ab87ef0340e61fbadf1eaa8e68db8a8d408..e74762f321d0cf5e2f7c83f308f6ace46cb3eaa9 100644
+--- a/services/webnn/public/cpp/platform_functions_win.cc
++++ b/services/webnn/public/cpp/platform_functions_win.cc
+@@ -28,19 +28,29 @@ struct ScopedWcharTypeTraits {
+ using ScopedWcharType = base::ScopedGeneric<wchar_t*, ScopedWcharTypeTraits>;
+ 
+ base::FilePath GetPackagePath(const wchar_t* package_full_name) {
++  // GetPackagePathByFullName() requires Windows 8.
++  static const auto get_package_path_by_full_name =
++      reinterpret_cast<decltype(&::GetPackagePathByFullName)>(
++          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                           "GetPackagePathByFullName"));
++  if (!get_package_path_by_full_name) {
++    return base::FilePath();
++  }
++
+   uint32_t path_length = 0;
+ 
+   // Get the required path length.
+   LONG result =
+-      GetPackagePathByFullName(package_full_name, &path_length, nullptr);
++      get_package_path_by_full_name(package_full_name, &path_length, nullptr);
+   if (result != ERROR_INSUFFICIENT_BUFFER) {
+     return base::FilePath();
+   }
+ 
+   // Get the actual path.
+   std::wstring path_buffer;
+-  result = GetPackagePathByFullName(package_full_name, &path_length,
+-                                    base::WriteInto(&path_buffer, path_length));
++  result = get_package_path_by_full_name(
++      package_full_name, &path_length,
++      base::WriteInto(&path_buffer, path_length));
+   if (result != ERROR_SUCCESS) {
+     return base::FilePath();
+   }
+diff --git a/third_party/ipcz/src/reference_drivers/random.cc b/third_party/ipcz/src/reference_drivers/random.cc
+index 29f8862b1a854b5d20e1857b116c2a4940b6f5cf..d341b3be6373cddf98b6d1f9398b95db9e30ff7f 100644
+--- a/third_party/ipcz/src/reference_drivers/random.cc
++++ b/third_party/ipcz/src/reference_drivers/random.cc
+@@ -42,13 +42,36 @@ namespace ipcz::reference_drivers {
+ namespace {
+ 
+ #if BUILDFLAG(IS_WIN)
++// ProcessPrng() requires Windows 10. Fall back to RtlGenRandom, exported by
++// advapi32 as SystemFunction036, which has a narrower signature.
++BOOL WINAPI RtlGenRandomFallback(PBYTE pbData, SIZE_T cbData) {
++  using RtlGenRandomFunc = BOOLEAN(WINAPI*)(PVOID, ULONG);
++  static const auto rtl_gen_random = reinterpret_cast<RtlGenRandomFunc>(
++      ::GetProcAddress(::LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
++  if (!rtl_gen_random) {
++    return FALSE;
++  }
++  while (cbData > 0) {
++    const ULONG chunk =
++        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
++    if (!rtl_gen_random(pbData, chunk)) {
++      return FALSE;
++    }
++    pbData += chunk;
++    cbData -= chunk;
++  }
++  return TRUE;
++}
++
+ decltype(&ProcessPrng) GetProcessPrng() {
+   HMODULE hmod = LoadLibraryW(L"bcryptprimitives.dll");
+   ABSL_ASSERT(hmod);
+   decltype(&ProcessPrng) process_prng_fn =
+       reinterpret_cast<decltype(&ProcessPrng)>(
+           GetProcAddress(hmod, "ProcessPrng"));
+-  ABSL_ASSERT(process_prng_fn);
++  if (!process_prng_fn) {
++    process_prng_fn = &RtlGenRandomFallback;
++  }
+   return process_prng_fn;
+ }
+ #endif

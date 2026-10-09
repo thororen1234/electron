@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:55:30 -0400
+Subject: fix: fall back to RtlGenRandom on Windows 7
+
+ProcessPrng is only exported by bcryptprimitives.dll on Windows 10, and
+BoringSSL aborts without it. Fall back to RtlGenRandom
+(advapi32!SystemFunction036), which is available on Windows 7.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/crypto/rand/windows.cc b/crypto/rand/windows.cc
+index ebd0d4afd33d5271a525c768c6bc7c3a30e2633e..c76c039748a8d62c5d543786d7b8cd1ef06bee3e 100644
+--- a/crypto/rand/windows.cc
++++ b/crypto/rand/windows.cc
+@@ -60,14 +60,40 @@ void bssl::CRYPTO_sysrand(uint8_t *out, size_t requested) {
+ typedef BOOL(WINAPI *ProcessPrngFunction)(PBYTE pbData, SIZE_T cbData);
+ static ProcessPrngFunction g_processprng_fn = nullptr;
+ 
++// ProcessPrng requires Windows 10. Fall back to RtlGenRandom, exported by
++// advapi32 as SystemFunction036, which has a narrower signature.
++typedef BOOLEAN(WINAPI *RtlGenRandomFunction)(PVOID buffer, ULONG length);
++static RtlGenRandomFunction g_rtlgenrandom_fn = nullptr;
++
++static BOOL WINAPI rtlgenrandom_processprng(PBYTE pbData, SIZE_T cbData) {
++  while (cbData > 0) {
++    ULONG chunk = cbData < 0xFFFFFFFFu ? (ULONG)cbData : 0xFFFFFFFFu;
++    if (!g_rtlgenrandom_fn(pbData, chunk)) {
++      return FALSE;
++    }
++    pbData += chunk;
++    cbData -= chunk;
++  }
++  return TRUE;
++}
++
+ static void init_processprng() {
+   HMODULE hmod = LoadLibraryW(L"bcryptprimitives");
+-  if (hmod == nullptr) {
+-    abort();
++  if (hmod != nullptr) {
++    g_processprng_fn =
++        (ProcessPrngFunction)GetProcAddress(hmod, "ProcessPrng");
+   }
+-  g_processprng_fn = (ProcessPrngFunction)GetProcAddress(hmod, "ProcessPrng");
+   if (g_processprng_fn == nullptr) {
+-    abort();
++    HMODULE advapi = LoadLibraryW(L"advapi32");
++    if (advapi == nullptr) {
++      abort();
++    }
++    g_rtlgenrandom_fn =
++        (RtlGenRandomFunction)GetProcAddress(advapi, "SystemFunction036");
++    if (g_rtlgenrandom_fn == nullptr) {
++      abort();
++    }
++    g_processprng_fn = rtlgenrandom_processprng;
+   }
+ }
+ 

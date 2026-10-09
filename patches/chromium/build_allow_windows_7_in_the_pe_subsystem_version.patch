@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:55:21 -0400
+Subject: build: allow Windows 7 in the PE subsystem version
+
+Windows refuses to load binaries whose subsystem version is newer than
+the OS, so set it to 6.01 (Windows 7) on x86 and x64. ARM64 still
+requires Windows 10.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index 069432bbae2fff5c76785bcbc97ec663e7f04b35..91c9b9bbbb2b5557c9155a8cba0e7b526c538220 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -631,8 +631,12 @@ config("static_crt") {
+ 
+ # This is appended to the subsystem to specify a minimum version.
+ # The number after the comma is the minimum required OS version.
+-# Set to 10.0 since we only support >= Win10 since M110.
+-subsystem_version_suffix = ",10.0"
++# Windows 7 (6.1) is supported on x86 and x64; ARM64 requires Windows 10.
++if (current_cpu == "arm64") {
++  subsystem_version_suffix = ",10.0"
++} else {
++  subsystem_version_suffix = ",6.01"
++}
+ 
+ config("console") {
+   ldflags = [ "/SUBSYSTEM:CONSOLE$subsystem_version_suffix" ]

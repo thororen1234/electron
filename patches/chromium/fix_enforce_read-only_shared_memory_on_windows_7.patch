@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:55:20 -0400
+Subject: fix: enforce read-only shared memory on Windows 7
+
+Windows versions before 8.1 ignore DACLs on unnamed sections, so a
+read-only handle to an anonymous section can still be duplicated as
+writable and the permission check fails. Give sections a random name on
+those versions, as Chromium did before dropping Windows 7.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/base/memory/platform_shared_memory_region_win.cc b/base/memory/platform_shared_memory_region_win.cc
+index d901a4b320f6feec245bb1cef64a34cfa58efb58..8adc2430e4ebdac2067c665733e17f710e17efd7 100644
+--- a/base/memory/platform_shared_memory_region_win.cc
++++ b/base/memory/platform_shared_memory_region_win.cc
+@@ -13,18 +13,22 @@
+ #include "base/bits.h"
+ #include "base/check.h"
+ #include "base/check_op.h"
++#include "base/containers/span.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/feature_list.h"
+ #include "base/features.h"
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/process/process_handle.h"
++#include "base/rand_util.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/threading/platform_thread.h"
+ #include "base/time/time.h"
+ #include "base/types/expected.h"
++#include "base/win/windows_version.h"
+ #include "partition_alloc/oom.h"
+ #include "partition_alloc/page_allocator.h"
+ 
+@@ -319,6 +323,15 @@ PlatformSharedMemoryRegion PlatformSharedMemoryRegion::Create(Mode mode,
+   }
+ 
+   std::u16string name;
++  if (win::GetVersion() < win::Version::WIN8_1) {
++    // Windows < 8.1 ignores DACLs on certain unnamed objects (like shared
++    // sections). So, we generate a random name when we need to enforce
++    // read-only.
++    uint64_t rand_values[4];
++    RandBytes(as_writable_byte_span(rand_values));
++    name = ASCIIToUTF16(
++        StrCat({"CrSharedMem_", HexEncode(as_byte_span(rand_values))}));
++  }
+   SECURITY_ATTRIBUTES sa = {sizeof(sa), &sd, FALSE};
+   // Ask for the file mapping with reduced permisions to avoid passing the
+   // access control permissions granted by default into unpriviledged process.

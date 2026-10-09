@@ -270,3 +270,8 @@ cherry-pick-744b0ccd6ad9.patch
 cherry-pick-713b2c1f6096.patch
 cherry-pick-8d07b5f3132f.patch
 cherry-pick-8b88e1034815.patch
+fix_resolve_windows_8_apis_at_runtime_for_windows_7.patch
+fix_restore_windows_7_sandbox_mitigation_handling.patch
+fix_use_smaller_partitionalloc_pools_before_windows_8_1.patch
+fix_enforce_read-only_shared_memory_on_windows_7.patch
+build_allow_windows_7_in_the_pe_subsystem_version.patch

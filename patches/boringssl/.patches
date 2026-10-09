@@ -1,2 +1,3 @@
 expose_ripemd160.patch
 feat_expose_several_extra_cipher_functions.patch
+fix_fall_back_to_rtlgenrandom_on_windows_7.patch
