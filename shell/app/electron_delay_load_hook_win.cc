@@ -86,8 +86,8 @@ HRESULT WINAPI SetProcessDpiAwarenessFallback(PROCESS_DPI_AWARENESS value) {
 
 HRESULT WINAPI GetProcessDpiAwarenessFallback(HANDLE,
                                               PROCESS_DPI_AWARENESS* value) {
-  *value = ::IsProcessDPIAware() ? PROCESS_SYSTEM_DPI_AWARE
-                                 : PROCESS_DPI_UNAWARE;
+  *value =
+      ::IsProcessDPIAware() ? PROCESS_SYSTEM_DPI_AWARE : PROCESS_DPI_UNAWARE;
   return S_OK;
 }
 
@@ -100,16 +100,23 @@ VOID WINAPI QueryUnbiasedInterruptTimePreciseFallback(PULONGLONG time) {
 }
 
 VOID WINAPI QueryInterruptTimeFallback(PULONGLONG time) {
-  // The interrupt time is KUSER_SHARED_DATA.InterruptTime, which is what
-  // QueryInterruptTime() reads.
-  const volatile ULONG* const interrupt_time =
-      reinterpret_cast<const volatile ULONG*>(0x7FFE0008);
-  ULONG high, low;
+  // QueryInterruptTime() reads KUSER_SHARED_DATA.InterruptTime, a KSYSTEM_TIME
+  // at a fixed address. High2Time is written first and High1Time last, so a
+  // torn read shows up as a mismatch.
+  struct KSystemTime {
+    ULONG low_part;
+    LONG high1_time;
+    LONG high2_time;
+  };
+  const volatile KSystemTime* const interrupt_time =
+      reinterpret_cast<const volatile KSystemTime*>(0x7FFE0008);
+  LONG high;
+  ULONG low;
   do {
-    high = interrupt_time[1];
-    low = interrupt_time[0];
-  } while (high != interrupt_time[2]);
-  *time = (static_cast<ULONGLONG>(high) << 32) | low;
+    high = interrupt_time->high1_time;
+    low = interrupt_time->low_part;
+  } while (high != interrupt_time->high2_time);
+  *time = (static_cast<ULONGLONG>(static_cast<ULONG>(high)) << 32) | low;
 }
 
 // WaitOnAddress() may return spuriously, so polling is a valid (if slower)
@@ -141,16 +148,11 @@ BOOL WINAPI ProcessPrngFallback(PBYTE data, SIZE_T size) {
   if (!rtl_gen_random) {
     return FALSE;
   }
-  while (size > 0) {
-    const ULONG chunk =
-        static_cast<ULONG>(size < 0xFFFFFFFFu ? size : 0xFFFFFFFFu);
-    if (!rtl_gen_random(data, chunk)) {
-      return FALSE;
-    }
-    data += chunk;
-    size -= chunk;
+  // Requests never come close to 4GiB; reject them rather than split them.
+  if (size > 0xFFFFFFFFu) {
+    return FALSE;
   }
-  return TRUE;
+  return rtl_gen_random(data, static_cast<ULONG>(size)) ? TRUE : FALSE;
 }
 
 BOOL WINAPI CompareObjectHandlesFallback(HANDLE first, HANDLE second) {
@@ -184,8 +186,7 @@ struct Fallback {
   FARPROC function;
 };
 
-#define FALLBACK(name, function) \
-  {#name, reinterpret_cast<FARPROC>(&function)}
+#define FALLBACK(name, function) {#name, reinterpret_cast<FARPROC>(&function)}
 #define FIXED(name, result) \
   {#name, reinterpret_cast<FARPROC>(&Fixed<decltype(&::name), result>::Call)}
 
