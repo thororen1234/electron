@@ -66,6 +66,14 @@ WIN8_PLUS_DLLS = re.compile(
     r'windows\.storage\.dll$|coremessaging\.dll$|mfsensorgroup\.dll$|'
     r'icu\.dll$|bcp47langs\.dll$|wer\.dll$|dxcore\.dll$)', re.IGNORECASE)
 
+# Exports added by updates that are required on top of Windows 7 SP1, so a
+# plain SP1 System32 doesn't have them. KB2533623 is also required by libuv.
+REQUIRED_UPDATE_EXPORTS = {
+    'kernel32.dll': {
+        'AddDllDirectory', 'RemoveDllDirectory', 'SetDefaultDllDirectories'
+    },
+}
+
 
 def find_dumpbin():
   vswhere = os.path.join(os.environ['ProgramFiles(x86)'],
@@ -94,24 +102,36 @@ def parse_imports(text):
   result = {'static': {}, 'delay': {}}
   kind = 'static'
   dll = None
+  # Static entries are "<hint> <name>"; delay-load entries are
+  # "<address> <hint> <name>" and are preceded by single-word header lines
+  # such as "00000001 Characteristics" that must not match.
+  entry = {
+      'static': re.compile(r'^\s+[0-9A-F]+\s+(\S+)\s*$'),
+      'delay': re.compile(r'^\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)\s*$'),
+  }
+  ordinal = re.compile(r'^\s+(?:[0-9A-F]+\s+)?Ordinal\s+(\d+)\s*$')
   for line in text.splitlines():
+    if line.strip() == 'Summary':
+      break
     if 'delay load imports' in line:
       kind = 'delay'
+      dll = None
       continue
-    m = re.match(r'^\s{4}(\S+\.(?:dll|DLL|exe|drv|sys))\s*$', line)
+    m = re.match(r'^\s{4}(\S+\.(?:dll|exe|drv|sys|cpl|ocx))\s*$', line,
+                 re.IGNORECASE)
     if m:
       dll = m.group(1).lower()
       result[kind].setdefault(dll, set())
       continue
     if dll is None:
       continue
-    m = re.match(r'^\s+[0-9A-F]+\s+(\S+)\s*$', line)
-    if m:
-      result[kind][dll].add(m.group(1))
-      continue
-    m = re.match(r'^\s+Ordinal\s+(\d+)\s*$', line)
+    m = ordinal.match(line)
     if m:
       result[kind][dll].add('#' + m.group(1))
+      continue
+    m = entry[kind].match(line)
+    if m:
+      result[kind][dll].add(m.group(1))
   return result
 
 
@@ -136,7 +156,7 @@ def win7_exports(dumpbin, system32, dll):
       names.add(m.group(2))
     elif line.strip() == 'Summary':
       break
-  return frozenset(names)
+  return frozenset(names | REQUIRED_UPDATE_EXPORTS.get(dll, set()))
 
 
 def check_binary(dumpbin, path, system32, own_dlls):
@@ -144,7 +164,8 @@ def check_binary(dumpbin, path, system32, own_dlls):
   problems = {'static': [], 'delay': []}
   for kind, dlls in imports.items():
     for dll, names in sorted(dlls.items()):
-      if dll in own_dlls:
+      # comctl32 v6 lives in WinSxS, not System32.
+      if dll in own_dlls or dll == 'comctl32.dll':
         continue
       exports = win7_exports(dumpbin, system32, dll) if system32 else None
       if system32 and exports is None and not WIN8_PLUS_DLLS.match(dll):
