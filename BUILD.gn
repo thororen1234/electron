@@ -1637,6 +1637,15 @@ if (is_mac) {
     }
   }
 
+  if (is_win) {
+    # Provides Windows 7 fallbacks for delay-loaded Windows 8+ functions. This
+    # must be a source_set so that its hook replaces the one in delayimp.lib.
+    source_set("electron_delay_load_hook") {
+      sources = [ "shell/app/electron_delay_load_hook_win.cc" ]
+      libs = [ "powrprof.lib" ]
+    }
+  }
+
   executable("electron_app") {
     output_name = electron_project_name
 
@@ -1692,6 +1701,7 @@ if (is_mac) {
       ]
 
       deps += [
+        ":electron_delay_load_hook",
         "//chrome/app:exit_code_watcher",
         "//components/crash/core/app:run_as_crashpad_handler",
       ]

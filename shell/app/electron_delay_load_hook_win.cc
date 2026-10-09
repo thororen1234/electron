@@ -1,0 +1,330 @@
+// Copyright (c) 2026 Electron contributors.
+// Use of this source code is governed by the MIT license that can be
+// found in the LICENSE file.
+
+// Provides Windows 7 fallbacks for delay-loaded functions and DLLs that only
+// exist on newer versions of Windows.
+//
+// Chromium delay-loads many Windows 8+ APIs and calls them without checking
+// the OS version. When one of them can't be resolved, the delay-load helper
+// calls the failure hook below, which returns a fallback with the same
+// signature: a Windows 7 equivalent where one exists, or a result that callers
+// already handle as "not supported". Anything without a fallback still fails
+// the usual way, after logging its name with OutputDebugString.
+
+#include <windows.h>
+
+#include <combaseapi.h>
+#include <d3d12.h>
+#include <dcomp.h>
+#include <delayimp.h>
+#include <dxgi1_3.h>
+#include <evntprov.h>
+#include <mfapi.h>
+#include <powrprof.h>
+#include <roapi.h>
+#include <roerrorapi.h>
+#include <shellscalingapi.h>
+#include <uiautomation.h>
+#include <userenv.h>
+#include <winstring.h>
+
+#include <cstring>
+
+namespace {
+
+// Returns a fixed result, with the exact signature of the function it
+// replaces so that stdcall argument cleanup is correct on 32-bit.
+template <typename F, auto kResult>
+struct Fixed;
+
+template <typename R, typename... Args, auto kResult>
+struct Fixed<R(WINAPI*)(Args...), kResult> {
+  static R WINAPI Call(Args...) { return static_cast<R>(kResult); }
+};
+
+template <typename... Args, auto kResult>
+struct Fixed<void(WINAPI*)(Args...), kResult> {
+  static void WINAPI Call(Args...) {}
+};
+
+// --- Windows 7 equivalents ----------------------------------------------
+
+HRESULT WINAPI GetDpiForMonitorFallback(HMONITOR,
+                                        MONITOR_DPI_TYPE,
+                                        UINT* dpi_x,
+                                        UINT* dpi_y) {
+  // Windows 7 only has a system-wide DPI.
+  HDC screen = ::GetDC(nullptr);
+  if (!screen) {
+    return E_FAIL;
+  }
+  *dpi_x = static_cast<UINT>(::GetDeviceCaps(screen, LOGPIXELSX));
+  *dpi_y = static_cast<UINT>(::GetDeviceCaps(screen, LOGPIXELSY));
+  ::ReleaseDC(nullptr, screen);
+  return S_OK;
+}
+
+HRESULT WINAPI GetScaleFactorForMonitorFallback(HMONITOR monitor,
+                                                DEVICE_SCALE_FACTOR* scale) {
+  UINT dpi_x = 96, dpi_y = 96;
+  if (FAILED(GetDpiForMonitorFallback(monitor, MDT_EFFECTIVE_DPI, &dpi_x,
+                                      &dpi_y))) {
+    return E_FAIL;
+  }
+  *scale = static_cast<DEVICE_SCALE_FACTOR>(dpi_x * 100 / 96);
+  return S_OK;
+}
+
+HRESULT WINAPI SetProcessDpiAwarenessFallback(PROCESS_DPI_AWARENESS value) {
+  // Windows 7 only supports system DPI awareness.
+  if (value != PROCESS_DPI_UNAWARE) {
+    ::SetProcessDPIAware();
+  }
+  return S_OK;
+}
+
+HRESULT WINAPI GetProcessDpiAwarenessFallback(HANDLE,
+                                              PROCESS_DPI_AWARENESS* value) {
+  *value = ::IsProcessDPIAware() ? PROCESS_SYSTEM_DPI_AWARE
+                                 : PROCESS_DPI_UNAWARE;
+  return S_OK;
+}
+
+POWER_PLATFORM_ROLE WINAPI PowerDeterminePlatformRoleExFallback(ULONG) {
+  return ::PowerDeterminePlatformRole();
+}
+
+VOID WINAPI QueryUnbiasedInterruptTimePreciseFallback(PULONGLONG time) {
+  ::QueryUnbiasedInterruptTime(time);
+}
+
+VOID WINAPI QueryInterruptTimeFallback(PULONGLONG time) {
+  // The interrupt time is KUSER_SHARED_DATA.InterruptTime, which is what
+  // QueryInterruptTime() reads.
+  const volatile ULONG* const interrupt_time =
+      reinterpret_cast<const volatile ULONG*>(0x7FFE0008);
+  ULONG high, low;
+  do {
+    high = interrupt_time[1];
+    low = interrupt_time[0];
+  } while (high != interrupt_time[2]);
+  *time = (static_cast<ULONGLONG>(high) << 32) | low;
+}
+
+// WaitOnAddress() may return spuriously, so polling is a valid (if slower)
+// implementation, and waking is then unnecessary.
+BOOL WINAPI WaitOnAddressFallback(volatile VOID* address,
+                                  PVOID compare_address,
+                                  SIZE_T address_size,
+                                  DWORD milliseconds) {
+  if (std::memcmp(const_cast<const void*>(address), compare_address,
+                  address_size) != 0) {
+    return TRUE;
+  }
+  if (milliseconds == 0) {
+    ::SetLastError(ERROR_TIMEOUT);
+    return FALSE;
+  }
+  ::Sleep(1);
+  return TRUE;
+}
+
+VOID WINAPI WakeByAddressFallback(PVOID) {}
+
+// ProcessPrng() requires Windows 10. RtlGenRandom, exported by advapi32 as
+// SystemFunction036, takes a ULONG size and returns a BOOLEAN.
+BOOL WINAPI ProcessPrngFallback(PBYTE data, SIZE_T size) {
+  using RtlGenRandomFunc = BOOLEAN(WINAPI*)(PVOID, ULONG);
+  static const auto rtl_gen_random = reinterpret_cast<RtlGenRandomFunc>(
+      ::GetProcAddress(::LoadLibraryW(L"advapi32.dll"), "SystemFunction036"));
+  if (!rtl_gen_random) {
+    return FALSE;
+  }
+  while (size > 0) {
+    const ULONG chunk =
+        static_cast<ULONG>(size < 0xFFFFFFFFu ? size : 0xFFFFFFFFu);
+    if (!rtl_gen_random(data, chunk)) {
+      return FALSE;
+    }
+    data += chunk;
+    size -= chunk;
+  }
+  return TRUE;
+}
+
+BOOL WINAPI CompareObjectHandlesFallback(HANDLE first, HANDLE second) {
+  // Without the Windows 10 API, only identical handle values can be
+  // recognized as the same object.
+  return first == second;
+}
+
+PCWSTR WINAPI WindowsGetStringRawBufferFallback(HSTRING, UINT32* length) {
+  if (length) {
+    *length = 0;
+  }
+  return L"";
+}
+
+ULONG WINAPI EventSetInformationFallback(REGHANDLE,
+                                         EVENT_INFO_CLASS,
+                                         PVOID,
+                                         ULONG) {
+  return ERROR_NOT_SUPPORTED;
+}
+
+BOOL WINAPI GetPointerTypeFallback(UINT32, POINTER_INPUT_TYPE*) {
+  // Pointer messages are never sent on Windows 7.
+  ::SetLastError(ERROR_INVALID_PARAMETER);
+  return FALSE;
+}
+
+struct Fallback {
+  const char* name;
+  FARPROC function;
+};
+
+#define FALLBACK(name, function) \
+  {#name, reinterpret_cast<FARPROC>(&function)}
+#define FIXED(name, result) \
+  {#name, reinterpret_cast<FARPROC>(&Fixed<decltype(&::name), result>::Call)}
+
+const Fallback kFallbacks[] = {
+    // shcore.dll (Windows 8.1)
+    FALLBACK(GetDpiForMonitor, GetDpiForMonitorFallback),
+    FALLBACK(GetScaleFactorForMonitor, GetScaleFactorForMonitorFallback),
+    FALLBACK(SetProcessDpiAwareness, SetProcessDpiAwarenessFallback),
+    FALLBACK(GetProcessDpiAwareness, GetProcessDpiAwarenessFallback),
+
+    // powrprof.dll (Windows 8)
+    FALLBACK(PowerDeterminePlatformRoleEx,
+             PowerDeterminePlatformRoleExFallback),
+    FIXED(PowerRegisterSuspendResumeNotification, ERROR_NOT_SUPPORTED),
+    FIXED(PowerUnregisterSuspendResumeNotification, ERROR_SUCCESS),
+
+    // kernel32.dll API sets (Windows 8 / 10)
+    FALLBACK(QueryUnbiasedInterruptTimePrecise,
+             QueryUnbiasedInterruptTimePreciseFallback),
+    FALLBACK(QueryInterruptTime, QueryInterruptTimeFallback),
+    FALLBACK(QueryInterruptTimePrecise, QueryInterruptTimeFallback),
+    FALLBACK(WaitOnAddress, WaitOnAddressFallback),
+    FALLBACK(WakeByAddressSingle, WakeByAddressFallback),
+    FALLBACK(WakeByAddressAll, WakeByAddressFallback),
+    FALLBACK(CompareObjectHandles, CompareObjectHandlesFallback),
+
+    // bcryptprimitives.dll (Windows 10)
+    FALLBACK(ProcessPrng, ProcessPrngFallback),
+
+    // advapi32.dll (Windows 8)
+    FALLBACK(EventSetInformation, EventSetInformationFallback),
+
+    // user32.dll (Windows 8 / 10 / 11)
+    FIXED(RegisterSuspendResumeNotification, nullptr),
+    FIXED(UnregisterSuspendResumeNotification, TRUE),
+    FIXED(RegisterPointerDeviceNotifications, FALSE),
+    FIXED(GetPointerDevices, FALSE),
+    FIXED(GetPointerDevice, FALSE),
+    FIXED(GetPointerInfo, FALSE),
+    FIXED(GetPointerPenInfo, FALSE),
+    FIXED(GetPointerTouchInfo, FALSE),
+    FIXED(GetPointerFrameTouchInfo, FALSE),
+    FALLBACK(GetPointerType, GetPointerTypeFallback),
+    FIXED(EnableMouseInPointer, FALSE),
+    FIXED(IsMouseInPointerEnabled, FALSE),
+    FIXED(IsWindowArranged, FALSE),
+
+    // uiautomationcore.dll (Windows 8)
+    FIXED(UiaDisconnectProvider, S_OK),
+    FIXED(UiaDisconnectAllProviders, S_OK),
+
+    // WinRT core (Windows 8)
+    FIXED(RoInitialize, E_NOTIMPL),
+    FIXED(RoUninitialize, 0),
+    FIXED(RoGetActivationFactory, E_NOTIMPL),
+    FIXED(RoActivateInstance, E_NOTIMPL),
+    FIXED(RoGetAgileReference, E_NOTIMPL),
+    FIXED(RoOriginateError, FALSE),
+    FIXED(RoOriginateErrorW, FALSE),
+    FIXED(WindowsCreateString, E_NOTIMPL),
+    FIXED(WindowsCreateStringReference, E_NOTIMPL),
+    FIXED(WindowsDeleteString, S_OK),
+    FIXED(WindowsDuplicateString, E_NOTIMPL),
+    FALLBACK(WindowsGetStringRawBuffer, WindowsGetStringRawBufferFallback),
+    FIXED(WindowsGetStringLen, 0),
+    FIXED(WindowsIsStringEmpty, TRUE),
+
+    // dcomp.dll, d3d12.dll, dxgi.dll (Windows 8 / 8.1 / 10)
+    FIXED(DCompositionCreateDevice, E_NOTIMPL),
+    FIXED(DCompositionCreateDevice2, E_NOTIMPL),
+    FIXED(DCompositionCreateDevice3, E_NOTIMPL),
+    FIXED(DCompositionCreateSurfaceHandle, E_NOTIMPL),
+    FIXED(D3D12CreateDevice, E_NOTIMPL),
+    FIXED(D3D12GetDebugInterface, E_NOTIMPL),
+    FIXED(D3D12SerializeRootSignature, E_NOTIMPL),
+    FIXED(D3D12SerializeVersionedRootSignature, E_NOTIMPL),
+    FIXED(CreateDXGIFactory2, E_NOTIMPL),
+    FIXED(DXGIGetDebugInterface1, E_NOTIMPL),
+
+    // mfplat.dll (Windows 8)
+    FIXED(MFCreateDXGIDeviceManager, E_NOTIMPL),
+    FIXED(MFCreateDXGISurfaceBuffer, E_NOTIMPL),
+    FIXED(MFLockDXGIDeviceManager, E_NOTIMPL),
+    FIXED(MFUnlockDXGIDeviceManager, E_NOTIMPL),
+
+    // userenv.dll (Windows 8)
+    FIXED(CreateAppContainerProfile, E_NOTIMPL),
+    FIXED(DeleteAppContainerProfile, E_NOTIMPL),
+    FIXED(DeriveAppContainerSidFromAppContainerName, E_NOTIMPL),
+    FIXED(GetAppContainerFolderPath, E_NOTIMPL),
+};
+
+#undef FALLBACK
+#undef FIXED
+
+FARPROC FindFallback(const char* name) {
+  for (const Fallback& fallback : kFallbacks) {
+    if (std::strcmp(fallback.name, name) == 0) {
+      return fallback.function;
+    }
+  }
+  return nullptr;
+}
+
+void LogMissing(const char* what, const char* dll, const char* name) {
+  char message[256];
+  ::wsprintfA(message, "Electron: no Windows 7 fallback for %s %s!%s\n", what,
+              dll ? dll : "?", name ? name : "?");
+  ::OutputDebugStringA(message);
+}
+
+FARPROC WINAPI DelayLoadFailureHook(unsigned reason, DelayLoadInfo* info) {
+  switch (reason) {
+    case dliFailLoadLib:
+      // The DLL doesn't exist on this version of Windows (e.g. dcomp.dll or an
+      // API set). Hand back kernel32 so that resolving each function fails and
+      // comes back here for a fallback.
+      return reinterpret_cast<FARPROC>(::GetModuleHandleW(L"kernel32.dll"));
+
+    case dliFailGetProc: {
+      if (!info->dlp.fImportByName) {
+        LogMissing("ordinal in", info->szDll, "?");
+        return nullptr;
+      }
+      FARPROC fallback = FindFallback(info->dlp.szProcName);
+      if (!fallback) {
+        LogMissing("function", info->szDll, info->dlp.szProcName);
+      }
+      return fallback;
+    }
+
+    default:
+      return nullptr;
+  }
+}
+
+}  // namespace
+
+// The delay-load helper in delayimp.lib calls this when a delay-loaded DLL or
+// function can't be resolved. This must have external linkage so that it
+// replaces the default in delayimp.lib at link time.
+extern "C" const PfnDliHook __pfnDliFailureHook2 = DelayLoadFailureHook;
