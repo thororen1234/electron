@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 03:43:02 -0400
+Subject: fix: resolve DNS synchronously before Windows 8
+
+GetAddrInfoExCancel and asynchronous (overlapped) GetAddrInfoExW require
+Windows 8, so importing the former prevents loading on Windows 7.
+Resolve GetAddrInfoExCancel at runtime and fall back to a synchronous
+lookup when it isn't available.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/rtc_base/async_dns_resolver.cc b/rtc_base/async_dns_resolver.cc
+index 395ae7217a1164bab821110ff4657e2af7dda77d..2ef329550b95b9737f39698b1f4448d60c65414f 100644
+--- a/rtc_base/async_dns_resolver.cc
++++ b/rtc_base/async_dns_resolver.cc
+@@ -41,6 +41,14 @@
+ namespace webrtc {
+ namespace {
+ #if defined(WEBRTC_WIN)
++// GetAddrInfoExCancel() and asynchronous GetAddrInfoExW() require Windows 8.
++decltype(&::GetAddrInfoExCancel) GetAddrInfoExCancelFunction() {
++  static const auto function =
++      reinterpret_cast<decltype(&::GetAddrInfoExCancel)>(::GetProcAddress(
++          ::GetModuleHandleW(L"ws2_32.dll"), "GetAddrInfoExCancel"));
++  return function;
++}
++
+ // Special support for the Windows specific addrinfo type.
+ bool IPFromAddrInfo(PADDRINFOEXW info, IPAddress* out) {
+   if (!info || !info->ai_addr ||
+@@ -157,8 +165,10 @@ AsyncDnsResolver::AsyncDnsResolver() = default;
+ AsyncDnsResolver::~AsyncDnsResolver() {
+   if (state_) {
+ #if defined(WEBRTC_WIN)
+-    RTC_DCHECK(cancel_);
+-    GetAddrInfoExCancel(&cancel_);
++    // Lookups are synchronous before Windows 8, so there's nothing to cancel.
++    if (cancel_) {
++      GetAddrInfoExCancelFunction()(&cancel_);
++    }
+ #endif
+     state_->Cancel();
+   }
+@@ -203,8 +213,12 @@ void AsyncDnsResolver::Start(const SocketAddress& addr,
+   std::wstring hostname = ToUtf16(addr.hostname());
+   ol_.hEvent = CreateEvent(nullptr, true, false, nullptr);
+   ADDRINFOEXW hints = {.ai_flags = AI_ADDRCONFIG, .ai_family = family};
++  // Asynchronous lookups require Windows 8, so resolve synchronously before
++  // that.
++  const bool async = GetAddrInfoExCancelFunction() != nullptr;
+   int ret = GetAddrInfoExW(hostname.c_str(), nullptr, NS_ALL, nullptr, &hints,
+-                           &addr_info_, nullptr, &ol_, nullptr, &cancel_);
++                           &addr_info_, nullptr, async ? &ol_ : nullptr,
++                           nullptr, async ? &cancel_ : nullptr);
+ 
+   // Check if the operation is done, continues asynchronously, or failed.
+   if (ret == ERROR_IO_PENDING) {  // Async.

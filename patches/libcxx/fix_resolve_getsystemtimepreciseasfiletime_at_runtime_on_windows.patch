@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 03:43:02 -0400
+Subject: fix: resolve GetSystemTimePreciseAsFileTime at runtime on Windows
+
+GetSystemTimePreciseAsFileTime requires Windows 8. Chromium builds with
+_WIN32_WINNT set to Windows 10, which makes libc++ import it directly.
+Use libc++'s existing runtime lookup on all desktop builds so that the
+binary still loads on Windows 7.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/src/chrono.cpp b/src/chrono.cpp
+index af5fe7c01fb8b7fa619ea92e96a3232d5f68f4c2..c7e484f95f6b24f840de3f4892cf0494beac8c9f 100644
+--- a/src/chrono.cpp
++++ b/src/chrono.cpp
+@@ -73,7 +73,9 @@ namespace chrono {
+ 
+ #if defined(_LIBCPP_WIN32API)
+ 
+-#  if _WIN32_WINNT < _WIN32_WINNT_WIN8
++// Electron: GetSystemTimePreciseAsFileTime() requires Windows 8, so always
++// resolve it at runtime on desktop to keep binaries loadable on Windows 7.
++#  if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+ 
+ namespace {
+ 
+@@ -106,13 +108,12 @@ static system_clock::time_point __libcpp_system_clock_now() {
+   static constexpr const seconds nt_to_unix_epoch{11644473600};
+ 
+   FILETIME ft;
+-#  if (_WIN32_WINNT >= _WIN32_WINNT_WIN8 && WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)) ||                      \
+-      (_WIN32_WINNT >= _WIN32_WINNT_WIN10)
++#  if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
++  GetSystemTimeAsFileTimeFunc.fp(&ft);
++#  elif _WIN32_WINNT >= _WIN32_WINNT_WIN10
+   GetSystemTimePreciseAsFileTime(&ft);
+-#  elif !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+-  GetSystemTimeAsFileTime(&ft);
+ #  else
+-  GetSystemTimeAsFileTimeFunc.fp(&ft);
++  GetSystemTimeAsFileTime(&ft);
+ #  endif
+ 
+   filetime_duration d{(static_cast<__int64>(ft.dwHighDateTime) << 32) | static_cast<__int64>(ft.dwLowDateTime)};

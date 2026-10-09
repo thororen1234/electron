@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 03:43:05 -0400
+Subject: build: use the Rust std Windows 7 code paths
+
+Rust's std imports Windows 8+ functions (GetSystemTimePreciseAsFileTime,
+WaitOnAddress, ...) unless it's built for a *-win7-windows-msvc target.
+Since Chromium builds std from source, enable its target_vendor="win7"
+code paths on Windows x86 and x64.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/build/rust/std/rules/BUILD.gn b/build/rust/std/rules/BUILD.gn
+index e1fe3a334079b1be5825e38ac7993030e9670b41..597eda7f72e8122813702ed46f447806ee61762d 100644
+--- a/build/rust/std/rules/BUILD.gn
++++ b/build/rust/std/rules/BUILD.gn
+@@ -3261,6 +3261,14 @@ cargo_crate("std") {
+     "-Zforce-unstable-if-unmarked",
+     "--cap-lints=allow",  # Suppress all warnings in stdlib crates
+   ]
++  if (is_win && current_cpu != "arm64") {
++    # Electron: use std's Windows 7 code paths, as the *-win7-windows-msvc
++    # targets do, so that it doesn't import Windows 8+ functions.
++    rustflags += [
++      "--cfg=target_vendor=\"win7\"",
++      "-Aexplicit_builtin_cfgs_in_flags",
++    ]
++  }
+   output_dir =
+       "$root_out_dir/local_rustc_sysroot/lib/rustlib/$rust_abi_target/lib/"
+ }
