@@ -29,7 +29,7 @@
 #include <userenv.h>
 #include <winstring.h>
 
-#include <cstring>
+#include <string_view>
 
 namespace {
 
@@ -119,14 +119,36 @@ VOID WINAPI QueryInterruptTimeFallback(PULONGLONG time) {
   *time = (static_cast<ULONGLONG>(static_cast<ULONG>(high)) << 32) | low;
 }
 
+// Returns whether the value at |address| still equals |compare_address|'s.
+// WaitOnAddress() only supports 1, 2, 4 and 8 byte values.
+bool ValueUnchanged(volatile VOID* address,
+                    PVOID compare_address,
+                    SIZE_T address_size) {
+  switch (address_size) {
+    case 1:
+      return *static_cast<volatile UINT8*>(address) ==
+             *static_cast<UINT8*>(compare_address);
+    case 2:
+      return *static_cast<volatile UINT16*>(address) ==
+             *static_cast<UINT16*>(compare_address);
+    case 4:
+      return *static_cast<volatile UINT32*>(address) ==
+             *static_cast<UINT32*>(compare_address);
+    case 8:
+      return *static_cast<volatile UINT64*>(address) ==
+             *static_cast<UINT64*>(compare_address);
+    default:
+      return false;
+  }
+}
+
 // WaitOnAddress() may return spuriously, so polling is a valid (if slower)
 // implementation, and waking is then unnecessary.
 BOOL WINAPI WaitOnAddressFallback(volatile VOID* address,
                                   PVOID compare_address,
                                   SIZE_T address_size,
                                   DWORD milliseconds) {
-  if (std::memcmp(const_cast<const void*>(address), compare_address,
-                  address_size) != 0) {
+  if (!ValueUnchanged(address, compare_address, address_size)) {
     return TRUE;
   }
   if (milliseconds == 0) {
@@ -284,7 +306,7 @@ const Fallback kFallbacks[] = {
 
 FARPROC FindFallback(const char* name) {
   for (const Fallback& fallback : kFallbacks) {
-    if (std::strcmp(fallback.name, name) == 0) {
+    if (std::string_view(fallback.name) == name) {
       return fallback.function;
     }
   }
