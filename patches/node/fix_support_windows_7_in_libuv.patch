@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 21:59:54 -0400
+Subject: fix: support Windows 7 in libuv
+
+libuv requires Windows 8+ for GetSystemTimePreciseAsFileTime() and
+GetHostNameW(). Resolve GetSystemTimePreciseAsFileTime() at runtime and
+fall back to GetSystemTimeAsFileTime() when it is unavailable, and fall
+back to GetComputerNameExW(ComputerNameDnsHostname) when GetHostNameW()
+is unavailable, so that the binary loads and works on Windows 7 SP1.
+
+This patch is needed for Windows 7 SP1+ support and is not suitable
+for upstreaming.
+
+diff --git a/deps/uv/src/win/util.c b/deps/uv/src/win/util.c
+index 650d6edde3a6ea653ca209a5cd015dcc7f556ef0..74f74f5cb98314bc89ffa100934d7363e520a246 100644
+--- a/deps/uv/src/win/util.c
++++ b/deps/uv/src/win/util.c
+@@ -440,7 +440,8 @@ int uv_clock_gettime(uv_clock_id clock_id, uv_timespec64_t* ts) {
+       ts->tv_nsec = t % 1000000000;
+       return 0;
+     case UV_CLOCK_REALTIME:
+-      GetSystemTimePreciseAsFileTime(&ft);
++      uv__once_init();
++      pGetSystemTimePreciseAsFileTime(&ft);
+       /* In 100-nanosecond increments from 1601-01-01 UTC because why not? */
+       t = (int64_t) ft.dwHighDateTime << 32 | ft.dwLowDateTime;
+       /* Convert to UNIX epoch, 1970-01-01. Still in 100 ns increments. */
+@@ -1409,11 +1410,16 @@ int uv_os_gethostname(char* buffer, size_t* size) {
+ 
+   uv__once_init(); /* Initialize winsock */
+ 
+-  if (pGetHostNameW == NULL)
+-    return UV_ENOSYS;
+-
+-  if (pGetHostNameW(buf, UV_MAXHOSTNAMESIZE) != 0)
+-    return uv_translate_sys_error(WSAGetLastError());
++  if (pGetHostNameW != NULL) {
++    if (pGetHostNameW(buf, UV_MAXHOSTNAMESIZE) != 0)
++      return uv_translate_sys_error(WSAGetLastError());
++  } else {
++    /* GetHostNameW() requires Windows 8. GetComputerNameExW() returns the
++     * same DNS host name and is available on Windows 7. */
++    DWORD len = ARRAY_SIZE(buf);
++    if (!GetComputerNameExW(ComputerNameDnsHostname, buf, &len))
++      return uv_translate_sys_error(GetLastError());
++  }
+ 
+   return uv__copy_utf16_to_utf8(buf, -1, buffer, size);
+ }
+diff --git a/deps/uv/src/win/winapi.c b/deps/uv/src/win/winapi.c
+index 7ed08dd2dc8d8874a498e770515cf92eee13ed37..800ecfa70ae30e1bf9bded71ae22a59e291613dc 100644
+--- a/deps/uv/src/win/winapi.c
++++ b/deps/uv/src/win/winapi.c
+@@ -51,6 +51,9 @@ uv_sGetHostNameW pGetHostNameW;
+ /* api-ms-win-core-file-l2-1-4.dll function pointer */
+ sGetFileInformationByName pGetFileInformationByName;
+ 
++/* kernel32.dll function pointer */
++uv_sGetSystemTimePreciseAsFileTime pGetSystemTimePreciseAsFileTime;
++
+ void uv__winapi_init(void) {
+   HMODULE ntdll_module;
+   HMODULE powrprof_module;
+@@ -58,6 +61,7 @@ void uv__winapi_init(void) {
+   HMODULE ws2_32_module;
+   HMODULE bcryptprimitives_module;
+   HMODULE api_win_core_file_module;
++  HMODULE kernel32_module;
+ 
+   union {
+     FARPROC proc;
+@@ -170,4 +174,12 @@ void uv__winapi_init(void) {
+                             "GetFileInformationByName");
+     pGetFileInformationByName = u.pGetFileInformationByName;
+   }
++
++  kernel32_module = GetModuleHandleA("kernel32.dll");
++  if (kernel32_module != NULL) {
++    pGetSystemTimePreciseAsFileTime = (uv_sGetSystemTimePreciseAsFileTime)
++      GetProcAddress(kernel32_module, "GetSystemTimePreciseAsFileTime");
++  }
++  if (pGetSystemTimePreciseAsFileTime == NULL)
++    pGetSystemTimePreciseAsFileTime = GetSystemTimeAsFileTime;
+ }
+diff --git a/deps/uv/src/win/winapi.h b/deps/uv/src/win/winapi.h
+index 2f25dc55fff9f4b43707850ec2a05301767009b6..1658df41bf2432d45d70e884b1c0a4537b4bb310 100644
+--- a/deps/uv/src/win/winapi.h
++++ b/deps/uv/src/win/winapi.h
+@@ -4840,4 +4840,10 @@ typedef int (WINAPI *uv_sGetHostNameW)
+              int);
+ extern uv_sGetHostNameW pGetHostNameW;
+ 
++/* kernel32.dll function pointer. GetSystemTimePreciseAsFileTime() requires
++ * Windows 8; on Windows 7 this points at GetSystemTimeAsFileTime(). */
++typedef VOID (WINAPI *uv_sGetSystemTimePreciseAsFileTime)
++             (LPFILETIME);
++extern uv_sGetSystemTimePreciseAsFileTime pGetSystemTimePreciseAsFileTime;
++
+ #endif /* UV_WIN_WINAPI_H_ */
