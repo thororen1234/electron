@@ -39,10 +39,10 @@ index 5861af19498944249a5a07d612d2826bc0d6633c..666322ff2775d409d23e630bfb8d261d
    // failure.
    if (ret) {
 diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
-index 1596bc2a31a29fd1fb08e8d6491253b04b1a5aaa..23f6f23f62779141b97caf21ec477165b9d0cc43 100644
+index 1596bc2a31a29fd1fb08e8d6491253b04b1a5aaa..8db47b2b711deb561bcbd73fb8b7557994c83afd 100644
 --- a/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
 +++ b/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_win.cc
-@@ -21,6 +21,31 @@ BOOL WINAPI ProcessPrng(PBYTE pbData, SIZE_T cbData);
+@@ -21,6 +21,26 @@ BOOL WINAPI ProcessPrng(PBYTE pbData, SIZE_T cbData);
  
  namespace partition_alloc::internal::base {
  
@@ -57,16 +57,11 @@ index 1596bc2a31a29fd1fb08e8d6491253b04b1a5aaa..23f6f23f62779141b97caf21ec477165
 +  if (!rtl_gen_random) {
 +    return FALSE;
 +  }
-+  while (cbData > 0) {
-+    const ULONG chunk =
-+        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
-+    if (!rtl_gen_random(pbData, chunk)) {
-+      return FALSE;
-+    }
-+    pbData += chunk;
-+    cbData -= chunk;
++  // Requests never come close to 4GiB; reject them rather than split them.
++  if (cbData > 0xFFFFFFFFu) {
++    return FALSE;
 +  }
-+  return TRUE;
++  return rtl_gen_random(pbData, static_cast<ULONG>(cbData)) ? TRUE : FALSE;
 +}
 +
 +}  // namespace
@@ -74,7 +69,7 @@ index 1596bc2a31a29fd1fb08e8d6491253b04b1a5aaa..23f6f23f62779141b97caf21ec477165
  void RandBytes(void* output, size_t output_length) {
    // Import bcryptprimitives directly rather than cryptbase to avoid opening a
    // handle to \\Device\KsecDD in the renderer.
-@@ -33,7 +58,9 @@ void RandBytes(void* output, size_t output_length) {
+@@ -33,7 +53,9 @@ void RandBytes(void* output, size_t output_length) {
      PA_BASE_CHECK(hmod);
      process_prng_fn = reinterpret_cast<decltype(&ProcessPrng)>(
          GetProcAddress(hmod, "ProcessPrng"));
@@ -147,10 +142,10 @@ index b44515c9baa976f80d6414b03bb0e628534dfdc5..a3879d9a9000c7bb4c9916ed9e58731e
    // failure.
    if (ret != ERROR_SUCCESS) {
 diff --git a/base/rand_util_win.cc b/base/rand_util_win.cc
-index bf9a489b95f2eb4ffd43c900eeb7d3c2e3fe8b08..6b06571d4657d3ba339b923045bdcf33b6d8dfdf 100644
+index bf9a489b95f2eb4ffd43c900eeb7d3c2e3fe8b08..1edbc900f18eeea03fbf1847f6e59482f706b68b 100644
 --- a/base/rand_util_win.cc
 +++ b/base/rand_util_win.cc
-@@ -50,6 +50,28 @@ bool UseBoringSSLForRandBytes() {
+@@ -50,6 +50,23 @@ bool UseBoringSSLForRandBytes() {
  
  namespace {
  
@@ -164,22 +159,17 @@ index bf9a489b95f2eb4ffd43c900eeb7d3c2e3fe8b08..6b06571d4657d3ba339b923045bdcf33
 +  if (!rtl_gen_random) {
 +    return FALSE;
 +  }
-+  while (cbData > 0) {
-+    const ULONG chunk =
-+        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
-+    if (!rtl_gen_random(pbData, chunk)) {
-+      return FALSE;
-+    }
-+    pbData += chunk;
-+    cbData -= chunk;
++  // Requests never come close to 4GiB; reject them rather than split them.
++  if (cbData > 0xFFFFFFFFu) {
++    return FALSE;
 +  }
-+  return TRUE;
++  return rtl_gen_random(pbData, static_cast<ULONG>(cbData)) ? TRUE : FALSE;
 +}
 +
  // Import bcryptprimitives!ProcessPrng rather than cryptbase!RtlGenRandom to
  // avoid opening a handle to \\Device\KsecDD in the renderer.
  decltype(&ProcessPrng) GetProcessPrng() {
-@@ -58,7 +80,9 @@ decltype(&ProcessPrng) GetProcessPrng() {
+@@ -58,7 +75,9 @@ decltype(&ProcessPrng) GetProcessPrng() {
    decltype(&ProcessPrng) process_prng_fn =
        reinterpret_cast<decltype(&ProcessPrng)>(
            GetProcAddress(hmod, "ProcessPrng"));
@@ -479,10 +469,10 @@ index 5e1806f6e5db9376403ed4f60ccc79bee72aad72..dd91e350fd080742323a884b8b20f3fb
          DLOG(WARNING) << "Cannot find " << package_full_name << ". rc=" << rc;
          package_paths.clear();
 diff --git a/sandbox/win/src/win_utils.cc b/sandbox/win/src/win_utils.cc
-index fc425d23651e5c2300f897c539e9912904ffe2b0..6c070603c950414b9889e20d8e307ff8ebe1b8ee 100644
+index fc425d23651e5c2300f897c539e9912904ffe2b0..5f1e84420cdcffac2c4f5e5b2347a63ab1030203 100644
 --- a/sandbox/win/src/win_utils.cc
 +++ b/sandbox/win/src/win_utils.cc
-@@ -74,6 +74,28 @@ std::unique_ptr<std::vector<uint8_t>> QueryObjectInformation(
+@@ -74,6 +74,23 @@ std::unique_ptr<std::vector<uint8_t>> QueryObjectInformation(
    return data;
  }
  
@@ -496,22 +486,17 @@ index fc425d23651e5c2300f897c539e9912904ffe2b0..6c070603c950414b9889e20d8e307ff8
 +  if (!rtl_gen_random) {
 +    return FALSE;
 +  }
-+  while (cbData > 0) {
-+    const ULONG chunk =
-+        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
-+    if (!rtl_gen_random(pbData, chunk)) {
-+      return FALSE;
-+    }
-+    pbData += chunk;
-+    cbData -= chunk;
++  // Requests never come close to 4GiB; reject them rather than split them.
++  if (cbData > 0xFFFFFFFFu) {
++    return FALSE;
 +  }
-+  return TRUE;
++  return rtl_gen_random(pbData, static_cast<ULONG>(cbData)) ? TRUE : FALSE;
 +}
 +
  // Import bcryptprimitives!ProcessPrng rather than cryptbase!RtlGenRandom to
  // avoid opening a handle to \\Device\KsecDD in the renderer.
  decltype(&ProcessPrng) GetProcessPrng() {
-@@ -82,7 +104,9 @@ decltype(&ProcessPrng) GetProcessPrng() {
+@@ -82,7 +99,9 @@ decltype(&ProcessPrng) GetProcessPrng() {
    decltype(&ProcessPrng) process_prng_fn =
        reinterpret_cast<decltype(&ProcessPrng)>(
            GetProcAddress(hmod, "ProcessPrng"));
@@ -560,10 +545,10 @@ index e8a27ab87ef0340e61fbadf1eaa8e68db8a8d408..e74762f321d0cf5e2f7c83f308f6ace4
      return base::FilePath();
    }
 diff --git a/third_party/ipcz/src/reference_drivers/random.cc b/third_party/ipcz/src/reference_drivers/random.cc
-index 29f8862b1a854b5d20e1857b116c2a4940b6f5cf..d341b3be6373cddf98b6d1f9398b95db9e30ff7f 100644
+index 29f8862b1a854b5d20e1857b116c2a4940b6f5cf..98333c9e0218b86a6d4c3f28a5718122827c6607 100644
 --- a/third_party/ipcz/src/reference_drivers/random.cc
 +++ b/third_party/ipcz/src/reference_drivers/random.cc
-@@ -42,13 +42,36 @@ namespace ipcz::reference_drivers {
+@@ -42,13 +42,31 @@ namespace ipcz::reference_drivers {
  namespace {
  
  #if BUILDFLAG(IS_WIN)
@@ -576,16 +561,11 @@ index 29f8862b1a854b5d20e1857b116c2a4940b6f5cf..d341b3be6373cddf98b6d1f9398b95db
 +  if (!rtl_gen_random) {
 +    return FALSE;
 +  }
-+  while (cbData > 0) {
-+    const ULONG chunk =
-+        static_cast<ULONG>(cbData < 0xFFFFFFFFu ? cbData : 0xFFFFFFFFu);
-+    if (!rtl_gen_random(pbData, chunk)) {
-+      return FALSE;
-+    }
-+    pbData += chunk;
-+    cbData -= chunk;
++  // Requests never come close to 4GiB; reject them rather than split them.
++  if (cbData > 0xFFFFFFFFu) {
++    return FALSE;
 +  }
-+  return TRUE;
++  return rtl_gen_random(pbData, static_cast<ULONG>(cbData)) ? TRUE : FALSE;
 +}
 +
  decltype(&ProcessPrng) GetProcessPrng() {

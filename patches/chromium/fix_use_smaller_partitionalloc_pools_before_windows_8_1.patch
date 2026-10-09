@@ -11,8 +11,21 @@ at runtime on those versions, as Chromium did before dropping Windows 7.
 This patch is needed for Windows 7 support and is not suitable for
 upstreaming.
 
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/internal/partition_address_space_internal.h b/base/allocator/partition_allocator/src/partition_alloc/internal/partition_address_space_internal.h
+index 50f23534ccc8b3b900a5d2cabdc0fc164b61c4d7..f0c5284b998e70f09b219533d557eeda1b92dfbd 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/internal/partition_address_space_internal.h
++++ b/base/allocator/partition_allocator/src/partition_alloc/internal/partition_address_space_internal.h
+@@ -128,7 +128,7 @@ PA_ALWAYS_INLINE uintptr_t PartitionAddressSpace::ConfigurablePoolBase() {
+ // and configurable pools).
+ #if PA_CONFIG(DYNAMICALLY_SELECT_POOL_SIZE)
+ PA_ALWAYS_INLINE size_t PartitionAddressSpace::MetadataRegionSize() {
+-  return metadata_region_size_;
++  return setup_.metadata_region_size_;
+ }
+ #else
+ PA_ALWAYS_INLINE constexpr size_t PartitionAddressSpace::MetadataRegionSize() {
 diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc b/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
-index c9216e469cac268278e6ba33455f815ec676c4b8..dba8f4f25246e54cf37b34695630ff96e0b28f4e 100644
+index c9216e469cac268278e6ba33455f815ec676c4b8..7e0ec47a7a786e3288b254fd782a0cf50e73678d 100644
 --- a/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
 +++ b/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.cc
 @@ -103,11 +103,40 @@ size_t PartitionAddressSpace::zero_segment_size_ = 0;
@@ -75,6 +88,25 @@ index c9216e469cac268278e6ba33455f815ec676c4b8..dba8f4f25246e54cf37b34695630ff96
    // On iOS we attempt to decrease the pool size, so we can collect metrics on
    // frequency and to "gracefully" handle such a situation, since we have
    // evidence it sometimes occurs.
+@@ -439,7 +469,7 @@ void PartitionAddressSpace::UninitForTesting() {
+   FreePages(setup_.metadata_region_start_, MetadataRegionSize());
+   setup_.metadata_region_start_ = kUninitializedPoolBaseAddress;
+ #if PA_CONFIG(DYNAMICALLY_SELECT_POOL_SIZE)
+-  metadata_region_size_ = 0;
++  setup_.metadata_region_size_ = 0;
+   is_core_pool_size_reduced_ = false;
+ #endif  // PA_CONFIG(DYNAMICALLY_SELECT_POOL_SIZE)
+   for (size_t i = 0; i < kMaxPoolHandle; ++i) {
+@@ -515,7 +545,8 @@ void PartitionAddressSpace::InitMetadataRegionAndOffsets() {
+ #endif  // PA_BUILDFLAG(ENABLE_MOVE_METADATA_OUT_OF_GIGACAGE_TRIAL)
+ 
+ #if PA_CONFIG(DYNAMICALLY_SELECT_POOL_SIZE)
+-  metadata_region_size_ = std::max(kConfigurablePoolMaxSize, CorePoolSize());
++  setup_.metadata_region_size_ =
++      std::max(kConfigurablePoolMaxSize, CorePoolSize());
+ #endif  // PA_CONFIG(DYNAMICALLY_SELECT_POOL_SIZE)
+ 
+   uintptr_t address =
 diff --git a/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.h b/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.h
 index 79caa914828640746f8d29596cb22d6ee83a4b54..c38479f8b843371acc903038706cca3f38179fb6 100644
 --- a/base/allocator/partition_allocator/src/partition_alloc/partition_address_space.h
