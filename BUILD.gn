@@ -1645,7 +1645,10 @@ if (is_mac) {
         "shell/app/electron_delay_load_hook_win.h",
       ]
       include_dirs = [ "." ]
-      deps = [ "//chrome/common/win:delay_load_hooks" ]
+      deps = [
+        "//base",
+        "//chrome/common/win:delay_load_hooks",
+      ]
       libs = [ "powrprof.lib" ]
     }
   }

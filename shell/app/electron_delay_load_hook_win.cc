@@ -33,6 +33,7 @@
 
 #include <string_view>
 
+#include "base/strings/string_util.h"
 #include "chrome/common/win/delay_load_notify_hook.h"
 
 namespace {
@@ -324,22 +325,49 @@ void LogMissing(const char* dll, const char* name) {
   ::OutputDebugStringA(message);
 }
 
+// Used for ordinal imports from a DLL that doesn't exist, whose signature is
+// unknown. On x64 every function shares a calling convention, so returning
+// E_NOTIMPL is safe; on x86 this is only correct for functions without
+// arguments, but nothing reaches it there in practice.
+HRESULT WINAPI NotImplementedStub() {
+  return E_NOTIMPL;
+}
+
+// Returns the Windows 7 DLL that implements |dll|, an API set or DLL that
+// doesn't exist on this version of Windows. kernel32 is never delay-loaded, so
+// a module resolved to kernel32 is always a stand-in.
+HMODULE GetStandInModule(const char* dll) {
+  if (base::StartsWith(dll, "api-ms-win-power-",
+                       base::CompareCase::INSENSITIVE_ASCII)) {
+    if (HMODULE powrprof = ::LoadLibraryExW(L"powrprof.dll", nullptr,
+                                            LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+      return powrprof;
+    }
+  }
+  return ::GetModuleHandleW(L"kernel32.dll");
+}
+
 FARPROC DelayLoadCallback(unsigned delay_load_event, DelayLoadInfo* info) {
   switch (delay_load_event) {
     case dliNotePreLoadLibrary: {
       // Load the DLL the same way the delay-load helper does. If it doesn't
       // exist on this version of Windows (e.g. dcomp.dll or an API set), use
-      // kernel32 so that each function falls back below.
+      // a stand-in so that each function resolves or falls back below.
       HMODULE module = ::LoadLibraryExA(info->szDll, nullptr, 0);
       if (!module) {
-        module = ::GetModuleHandleW(L"kernel32.dll");
+        module = GetStandInModule(info->szDll);
       }
       return reinterpret_cast<FARPROC>(module);
     }
 
     case dliNotePreGetProcAddress: {
       if (!info->dlp.fImportByName) {
-        return nullptr;  // Let the helper resolve ordinals.
+        // An ordinal means nothing in a stand-in module.
+        if (info->hmodCur == ::GetModuleHandleW(L"kernel32.dll")) {
+          LogMissing(info->szDll, "(ordinal)");
+          return reinterpret_cast<FARPROC>(&NotImplementedStub);
+        }
+        return nullptr;  // Let the helper resolve it.
       }
       if (FARPROC function =
               ::GetProcAddress(info->hmodCur, info->dlp.szProcName)) {
