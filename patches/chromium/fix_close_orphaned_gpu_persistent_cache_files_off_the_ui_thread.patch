@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:02:54 -0400
+Subject: fix: close orphaned GPU persistent cache files off the UI thread
+
+When the GPU process goes away before the persistent cache files are
+created, the pending backend was destroyed on the UI thread, which
+closes files and trips the blocking-call DCHECK. This happens when the
+GPU process repeatedly fails to start, e.g. on Windows 7 without the
+Platform Update. Destroy it on a thread pool task that may block.
+
+diff --git a/components/viz/host/gpu_host_impl.cc b/components/viz/host/gpu_host_impl.cc
+index da5b044bccf2cf1167d8e704a5e4dcdc1091ff02..0ac43b7cbc4670813925ab8987b812920b5feac0 100644
+--- a/components/viz/host/gpu_host_impl.cc
++++ b/components/viz/host/gpu_host_impl.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/strcat.h"
+ #include "base/system/sys_info.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
+ #include "base/threading/thread_checker.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/values.h"
+@@ -507,7 +508,17 @@ void GpuHostImpl::InitPersistentCache() {
+                  gpu::GpuDiskCacheHandle handle,
+                  std::optional<persistent_cache::PendingBackend>
+                      pending_backend) {
+-                if (!gpu_host || !pending_backend) {
++                if (!pending_backend) {
++                  return;
++                }
++                if (!gpu_host) {
++                  // Closing the backend's files blocks, which isn't allowed
++                  // on this thread.
++                  base::ThreadPool::PostTask(
++                      FROM_HERE,
++                      {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++                      base::DoNothingWithBoundArgs(
++                          std::move(*pending_backend)));
+                   return;
+                 }
+ 
