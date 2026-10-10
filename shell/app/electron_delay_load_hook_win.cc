@@ -13,6 +13,11 @@
 // callers already handle as "not supported". Anything without a fallback
 // still fails the usual way, after logging its name with OutputDebugString.
 
+#ifdef UNSAFE_BUFFERS_BUILD
+// This file implements Windows ABI fallbacks on raw buffers.
+#pragma allow_unsafe_buffers
+#endif
+
 #include "shell/app/electron_delay_load_hook_win.h"
 
 #include <windows.h>
@@ -31,6 +36,8 @@
 #include <userenv.h>
 #include <winstring.h>
 
+#include <algorithm>
+#include <new>
 #include <string_view>
 
 #include "base/strings/string_util.h"
@@ -200,11 +207,94 @@ void WINAPI RoUninitializeFallback() {
   ::CoUninitialize();
 }
 
-PCWSTR WINAPI WindowsGetStringRawBufferFallback(HSTRING, UINT32* length) {
-  if (length) {
-    *length = 0;
+// Before Windows 8 there is no WinRT string support at all, so every HSTRING
+// comes from these fallbacks and can use its own representation. Callers treat
+// string creation as infallible, so these have to work rather than fail.
+struct FallbackHString {
+  bool is_reference;
+  UINT32 length;
+  const wchar_t* buffer;
+};
+static_assert(sizeof(FallbackHString) <= sizeof(HSTRING_HEADER));
+
+const FallbackHString* FromHString(HSTRING string) {
+  return reinterpret_cast<const FallbackHString*>(string);
+}
+
+HRESULT WINAPI WindowsCreateStringFallback(PCNZWCH source,
+                                           UINT32 length,
+                                           HSTRING* string) {
+  if (!string) {
+    return E_INVALIDARG;
   }
-  return L"";
+  *string = nullptr;
+  if (length == 0) {
+    return S_OK;
+  }
+  if (!source) {
+    return E_POINTER;
+  }
+  auto* buffer = new wchar_t[length + 1];
+  std::copy(source, source + length, buffer);
+  buffer[length] = L'\0';
+  *string = reinterpret_cast<HSTRING>(
+      new FallbackHString{/*is_reference=*/false, length, buffer});
+  return S_OK;
+}
+
+HRESULT WINAPI WindowsCreateStringReferenceFallback(PCWSTR source,
+                                                    UINT32 length,
+                                                    HSTRING_HEADER* header,
+                                                    HSTRING* string) {
+  if (!string || !header) {
+    return E_INVALIDARG;
+  }
+  *string = nullptr;
+  if (length == 0) {
+    return S_OK;
+  }
+  if (!source) {
+    return E_POINTER;
+  }
+  // A string reference lives in the caller-provided header.
+  *string = reinterpret_cast<HSTRING>(
+      new (header) FallbackHString{/*is_reference=*/true, length, source});
+  return S_OK;
+}
+
+HRESULT WINAPI WindowsDeleteStringFallback(HSTRING string) {
+  const FallbackHString* fallback = FromHString(string);
+  if (fallback && !fallback->is_reference) {
+    delete[] fallback->buffer;
+    delete fallback;
+  }
+  return S_OK;
+}
+
+HRESULT WINAPI WindowsDuplicateStringFallback(HSTRING string,
+                                              HSTRING* new_string) {
+  const FallbackHString* fallback = FromHString(string);
+  return WindowsCreateStringFallback(fallback ? fallback->buffer : nullptr,
+                                     fallback ? fallback->length : 0,
+                                     new_string);
+}
+
+PCWSTR WINAPI WindowsGetStringRawBufferFallback(HSTRING string,
+                                                UINT32* length) {
+  const FallbackHString* fallback = FromHString(string);
+  if (length) {
+    *length = fallback ? fallback->length : 0;
+  }
+  return fallback ? fallback->buffer : L"";
+}
+
+UINT32 WINAPI WindowsGetStringLenFallback(HSTRING string) {
+  const FallbackHString* fallback = FromHString(string);
+  return fallback ? fallback->length : 0;
+}
+
+BOOL WINAPI WindowsIsStringEmptyFallback(HSTRING string) {
+  return WindowsGetStringLenFallback(string) == 0;
 }
 
 ULONG WINAPI EventSetInformationFallback(REGHANDLE,
@@ -285,13 +375,14 @@ const Fallback kFallbacks[] = {
     FIXED(RoGetAgileReference, E_NOTIMPL),
     FIXED(RoOriginateError, FALSE),
     FIXED(RoOriginateErrorW, FALSE),
-    FIXED(WindowsCreateString, E_NOTIMPL),
-    FIXED(WindowsCreateStringReference, E_NOTIMPL),
-    FIXED(WindowsDeleteString, S_OK),
-    FIXED(WindowsDuplicateString, E_NOTIMPL),
+    FALLBACK(WindowsCreateString, WindowsCreateStringFallback),
+    FALLBACK(WindowsCreateStringReference,
+             WindowsCreateStringReferenceFallback),
+    FALLBACK(WindowsDeleteString, WindowsDeleteStringFallback),
+    FALLBACK(WindowsDuplicateString, WindowsDuplicateStringFallback),
     FALLBACK(WindowsGetStringRawBuffer, WindowsGetStringRawBufferFallback),
-    FIXED(WindowsGetStringLen, 0),
-    FIXED(WindowsIsStringEmpty, TRUE),
+    FALLBACK(WindowsGetStringLen, WindowsGetStringLenFallback),
+    FALLBACK(WindowsIsStringEmpty, WindowsIsStringEmptyFallback),
 
     // dcomp.dll, d3d12.dll, dxgi.dll (Windows 8 / 8.1 / 10)
     FIXED(DCompositionCreateDevice, E_NOTIMPL),
