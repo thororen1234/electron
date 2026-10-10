@@ -188,6 +188,18 @@ BOOL WINAPI CompareObjectHandlesFallback(HANDLE first, HANDLE second) {
   return first == second;
 }
 
+// WinRT apartments are COM apartments; before Windows 8, initializing COM is
+// what RoInitialize() would have done for the callers that only need COM.
+HRESULT WINAPI RoInitializeFallback(RO_INIT_TYPE init_type) {
+  return ::CoInitializeEx(nullptr, init_type == RO_INIT_SINGLETHREADED
+                                       ? COINIT_APARTMENTTHREADED
+                                       : COINIT_MULTITHREADED);
+}
+
+void WINAPI RoUninitializeFallback() {
+  ::CoUninitialize();
+}
+
 PCWSTR WINAPI WindowsGetStringRawBufferFallback(HSTRING, UINT32* length) {
   if (length) {
     *length = 0;
@@ -266,8 +278,8 @@ const Fallback kFallbacks[] = {
     FIXED(UiaDisconnectAllProviders, S_OK),
 
     // WinRT core (Windows 8)
-    FIXED(RoInitialize, E_NOTIMPL),
-    FIXED(RoUninitialize, 0),
+    FALLBACK(RoInitialize, RoInitializeFallback),
+    FALLBACK(RoUninitialize, RoUninitializeFallback),
     FIXED(RoGetActivationFactory, E_NOTIMPL),
     FIXED(RoActivateInstance, E_NOTIMPL),
     FIXED(RoGetAgileReference, E_NOTIMPL),
