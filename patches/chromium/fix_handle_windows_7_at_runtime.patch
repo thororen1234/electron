@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 16:42:49 -0400
+Subject: fix: handle Windows 7 at runtime
+
+Code paths that assume Windows 10 or later and fail on Windows 7:
+
+* Report the legacy Sec-CH-UA-Platform-Version (0.1.0, 0.2.0, 0.3.0)
+  before Windows 10 instead of hitting NOTREACHED, as Chromium did
+  before dropping Windows 7.
+* Only pass REG_NOTIFY_THREAD_AGNOSTIC to RegNotifyChangeKeyValue on
+  Windows 8+, since it makes every registry watch fail on Windows 7.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/base/win/registry.cc b/base/win/registry.cc
+index 7bb1482457186be40bc62e7035b8d4ffe7b9bc4c..43ba84bf2e45cb39f905dda009d7ca3d1690b146 100644
+--- a/base/win/registry.cc
++++ b/base/win/registry.cc
+@@ -25,6 +25,7 @@
+ #include "base/win/object_watcher.h"
+ #include "base/win/scoped_handle.h"
+ #include "base/win/shlwapi.h"
++#include "base/win/windows_version.h"
+ 
+ extern "C" NTSTATUS WINAPI NtDeleteKey(IN HANDLE KeyHandle);
+ 
+@@ -97,8 +98,12 @@ bool RegKey::Watcher::StartWatching(HKEY key, ChangeCallback callback) {
+   }
+ 
+   DWORD filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
+-                 REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY |
+-                 REG_NOTIFY_THREAD_AGNOSTIC;
++                 REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY;
++  // REG_NOTIFY_THREAD_AGNOSTIC requires Windows 8, and makes the call fail
++  // with ERROR_INVALID_PARAMETER before that.
++  if (GetVersion() >= Version::WIN8) {
++    filter |= REG_NOTIFY_THREAD_AGNOSTIC;
++  }
+   // Watch the registry key for a change of value.
+   LONG result =
+       RegNotifyChangeKeyValue(key, /*bWatchSubtree=*/TRUE, filter,
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 3f87ec84fb32acff28c7efa855409a89395af80d..e62a0044468947096772776ec7c3d0f05ad1eb56 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -149,7 +149,35 @@ const std::string& GetUniversalApiContractVersion() {
+   return *universal_api_contract_version;
+ }
+ 
++// Return the legacy windows platform version to match the spec description
++// https://wicg.github.io/ua-client-hints/#get-the-legacy-windows-version-number,
++// which is available for Windows versions between range WIN7 and WIN8_1.
++const std::string& GetLegacyWindowsPlatformVersion() {
++  static const base::NoDestructor<std::string> legacy_windows_platform_version(
++      [] {
++        int minor_version = 0;
++        switch (base::win::OSInfo::Kernel32Version()) {
++          case base::win::Version::WIN7:
++            minor_version = 1;
++            break;
++          case base::win::Version::WIN8:
++            minor_version = 2;
++            break;
++          case base::win::Version::WIN8_1:
++            minor_version = 3;
++            break;
++          default:
++            break;
++        }
++        return base::StrCat({"0.", base::NumberToString(minor_version), ".0"});
++      }());
++  return *legacy_windows_platform_version;
++}
++
+ const std::string& GetWindowsPlatformVersion() {
++  if (base::win::OSInfo::Kernel32Version() < base::win::Version::WIN10) {
++    return GetLegacyWindowsPlatformVersion();
++  }
+   return GetUniversalApiContractVersion();
+ }
+ #endif  // BUILDFLAG(IS_WIN)
