@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:55:17 -0400
+Subject: fix: restore Windows 7 sandbox support
+
+Restore what Chromium did before dropping Windows 7 (M109), adapted to
+the current sandbox:
+
+* Windows 7 only supports the DEP and SEHOP process creation
+  mitigations, passed as a DWORD on 32-bit, and has no
+  Get/SetProcessMitigationPolicy, so restore the version checks.
+* PROC_THREAD_ATTRIBUTE_JOB_LIST requires Windows 10, so assign the
+  suspended target to its job after creation, breaking away from any job
+  the broker is in on Windows 7 (no nested jobs), or staying in it when
+  breaking away isn't allowed.
+* ProcessHandleTable requires Windows 8.1, so the handle closer probes
+  handle values instead before that.
+* Skip AppContainers and the DeviceApi handle before Windows 8.
+* Only renderers and the GPU process are sandboxed on Windows 7; other
+  child processes rely on Windows 10 sandbox features, so they run
+  unsandboxed and are told so with --no-sandbox.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
+index daeb9327d28fab06bcb1375606e18419063850d6..f53bef6c8bde79b7f8e1b37caf1af30494e0242b 100644
+--- a/sandbox/policy/win/sandbox_win.cc
++++ b/sandbox/policy/win/sandbox_win.cc
+@@ -222,7 +222,10 @@ ResultCode AddDefaultConfigForSandboxedProcess(TargetConfig* config) {
+     return result;
+ 
+   config->SetLockdownDefaultDacl();
+-  config->AddKernelObjectToClose(HandleToClose::kDeviceApi);
++  // Win8+ adds a device DeviceApi that we don't need.
++  if (base::win::GetVersion() >= base::win::Version::WIN8) {
++    config->AddKernelObjectToClose(HandleToClose::kDeviceApi);
++  }
+   config->SetDesktop(Desktop::kAlternateWinstation);
+ 
+   return SBOX_ALL_OK;
+@@ -639,7 +642,13 @@ ResultCode LaunchWithoutSandbox(
+   // does not outlive the browser, which could happen if there is a lot of I/O
+   // on process shutdown, in which case TerminateProcess can fail. See
+   // https://crbug.com/820996.
+-  if (delegate->ShouldUnsandboxedRunInJob()) {
++  // Prior to Windows 8 nested jobs aren't possible, so skip the job if this
++  // process is already in one.
++  BOOL in_job = FALSE;
++  const bool can_use_job =
++      base::win::GetVersion() >= base::win::Version::WIN8 ||
++      (::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) && !in_job);
++  if (delegate->ShouldUnsandboxedRunInJob() && can_use_job) {
+     static base::NoDestructor<base::win::ScopedHandle> job_object(
+         CreateUnsandboxedJob());
+     if (!job_object->is_valid()) {
+@@ -671,6 +680,13 @@ bool IsUnsandboxedProcess(
+     const base::CommandLine& launcher_process_command_line) {
+   if (IsUnsandboxedSandboxType(sandbox_type))
+     return true;
++  // On Windows 7 only renderers and the GPU process are sandboxed, as in
++  // Chromium before M110. Utility process sandboxes rely on features that
++  // don't exist before Windows 10, such as AppContainers.
++  if (base::win::GetVersion() < base::win::Version::WIN8 &&
++      sandbox_type != Sandbox::kRenderer && sandbox_type != Sandbox::kGpu) {
++    return true;
++  }
+   if (cmd_line.HasSwitch(switches::kNoSandbox))
+     return true;
+   if (launcher_process_command_line.HasSwitch(switches::kNoSandbox))
+@@ -738,6 +754,10 @@ void SandboxWin::AddBaseHandleClosePolicy(TargetConfig* config) {
+ ResultCode SandboxWin::AddAppContainerPolicy(TargetConfig* config,
+                                              base::wcstring_view sid) {
+   DCHECK(!config->IsConfigured());
++  // AppContainers require Windows 8.
++  if (base::win::GetVersion() < base::win::Version::WIN8) {
++    return SBOX_ALL_OK;
++  }
+   if (IsAppContainerEnabled()) {
+     ResultCode result = config->SetLowBox(sid);
+     if (result != SBOX_ALL_OK) {
+@@ -972,9 +992,17 @@ ResultCode SandboxWin::StartSandboxedProcess(
+   // Avoid making a policy if we won't use it.
+   if (IsUnsandboxedProcess(delegate->GetSandboxType(), cmd_line,
+                            *base::CommandLine::ForCurrentProcess())) {
++    // Most child processes run unsandboxed on Windows 7 (see
++    // IsUnsandboxedProcess()). Tell them so, or processes that expect a
++    // sandbox fail to enable it and exit.
++    base::CommandLine child_cmd_line = cmd_line;
++    if (base::win::GetVersion() < base::win::Version::WIN8 &&
++        !child_cmd_line.HasSwitch(switches::kNoSandbox)) {
++      child_cmd_line.AppendSwitch(switches::kNoSandbox);
++    }
+     base::Process process;
+     ResultCode result =
+-        LaunchWithoutSandbox(cmd_line, *options, delegate, &process);
++        LaunchWithoutSandbox(child_cmd_line, *options, delegate, &process);
+     DWORD last_error = GetLastError();
+     std::move(result_callback).Run(std::move(process), last_error, result);
+     return SBOX_ALL_OK;
+diff --git a/sandbox/win/src/broker_services.cc b/sandbox/win/src/broker_services.cc
+index 1787c7f7749b106e114add997caecc46d3bacd90..b558b3d96b59c8934c419a4ac294292eb1ff4c4e 100644
+--- a/sandbox/win/src/broker_services.cc
++++ b/sandbox/win/src/broker_services.cc
+@@ -278,6 +278,27 @@ ResultCode CreateSandboxProcess(
+   if (startup_info->has_extended_startup_info()) {
+     flags |= EXTENDED_STARTUPINFO_PRESENT;
+   }
++
++  // Before Windows 10 the job is assigned after creation. Windows 7 doesn't
++  // support nested jobs, so break away from any job this process is in, or
++  // leave the target in that job if breaking away isn't allowed.
++  HANDLE job = startup_info_helper->job_to_assign_after_creation();
++  if (job && base::win::GetVersion() < base::win::Version::WIN8) {
++    BOOL in_job = FALSE;
++    if (::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job) && in_job) {
++      JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_info = {};
++      if (::QueryInformationJobObject(nullptr,
++                                      JobObjectExtendedLimitInformation,
++                                      &job_info, sizeof(job_info), nullptr) &&
++          (job_info.BasicLimitInformation.LimitFlags &
++           JOB_OBJECT_LIMIT_BREAKAWAY_OK)) {
++        flags |= CREATE_BREAKAWAY_FROM_JOB;
++      } else {
++        job = nullptr;
++      }
++    }
++  }
++
+   bool inherit_handles = startup_info_helper->ShouldInheritHandles();
+   PROCESS_INFORMATION temp_process_info = {};
+   std::wstring args = command_line.GetCommandLineString();
+@@ -294,6 +315,13 @@ ResultCode CreateSandboxProcess(
+   }
+ 
+   process_info.Set(temp_process_info);
++
++  if (job && !::AssignProcessToJobObject(job, process_info.process_handle())) {
++    win_error = ::GetLastError();
++    ::TerminateProcess(process_info.process_handle(), 0);
++    return SBOX_ERROR_ASSIGN_PROCESS_TO_JOB_OBJECT;
++  }
++
+   // Change the token of the main thread of the new process for the
+   // impersonation token with more rights. This allows the target to start;
+   // otherwise it will crash too early for us to help.
+diff --git a/sandbox/win/src/handle_closer_agent.cc b/sandbox/win/src/handle_closer_agent.cc
+index 047fe689715a196b259f0eaf787e2410b1f30edf..f1457402ff3ef285eb5c202c484d80f63a6c60ed 100644
+--- a/sandbox/win/src/handle_closer_agent.cc
++++ b/sandbox/win/src/handle_closer_agent.cc
+@@ -18,6 +18,7 @@
+ #include "base/win/static_constants.h"
+ #include "base/win/win_util.h"
+ #include "base/win/windows_handle_util.h"
++#include "base/win/windows_version.h"
+ #include "sandbox/win/src/heap_helper.h"
+ #include "sandbox/win/src/win_utils.h"
+ 
+@@ -175,6 +176,30 @@ bool HandleCloserAgent::CloseHandles() {
+       handles.data(), static_cast<ULONG>(handles.size() * sizeof(uint32_t)),
+       &return_length);
+ 
++  if (!NT_SUCCESS(status) &&
++      base::win::GetVersion() < base::win::Version::WIN8_1) {
++    // ProcessHandleTable requires Windows 8.1. Before that, probe handle
++    // values until every handle of the process has been found. Handles are
++    // multiples of 4, and a long run of invalid values means we've passed the
++    // end of the table.
++    constexpr int kInvalidHandleThreshold = 100;
++    uint32_t handle_value = 0;
++    int invalid_count = 0;
++    while (handle_count > 0 && invalid_count < kInvalidHandleThreshold) {
++      handle_value += 4;
++      HANDLE handle = base::win::Uint32ToHandle(handle_value);
++      auto type_name = GetTypeNameFromHandle(handle);
++      if (!type_name) {
++        ++invalid_count;
++        continue;
++      }
++      invalid_count = 0;
++      --handle_count;
++      MaybeCloseHandle(type_name.value(), handle);
++    }
++    return true;
++  }
++
+   if (!NT_SUCCESS(status)) {
+     ::SetLastError(GetLastErrorFromNtStatus(status));
+     return false;
+diff --git a/sandbox/win/src/process_mitigations.cc b/sandbox/win/src/process_mitigations.cc
+index 38ae75ee7b2b9716b3f7c57b6f9c74a67a911d7b..beb590a7620159dca8f20e76f991db5ff010979a 100644
+--- a/sandbox/win/src/process_mitigations.cc
++++ b/sandbox/win/src/process_mitigations.cc
+@@ -58,9 +58,16 @@ const ULONG64* GetSupportedMitigations() {
+         (base::win::GetVersion() >= base::win::Version::WIN10_RS2)
+             ? (sizeof(mitigations[0]) * 2)
+             : sizeof(mitigations[0]);
+-    if (!::GetProcessMitigationPolicy(::GetCurrentProcess(),
+-                                      ProcessMitigationOptionsMask,
+-                                      &mitigations, mits_size)) {
++    // GetProcessMitigationPolicy() requires Windows 8. Before that, no
++    // mitigations beyond DEP and SEHOP are supported.
++    static const auto get_process_mitigation_policy =
++        reinterpret_cast<decltype(&::GetProcessMitigationPolicy)>(
++            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                             "GetProcessMitigationPolicy"));
++    if (get_process_mitigation_policy &&
++        !get_process_mitigation_policy(::GetCurrentProcess(),
++                                       ProcessMitigationOptionsMask,
++                                       &mitigations, mits_size)) {
+       NOTREACHED();
+     }
+   }
+@@ -85,7 +92,14 @@ bool IsRunning32bitEmulatedOnArm64() {
+ bool SetProcessMitigationPolicyInternal(PROCESS_MITIGATION_POLICY policy,
+                                         PVOID lpBuffer,
+                                         SIZE_T dwLength) {
+-  PCHECK(::SetProcessMitigationPolicy(policy, lpBuffer, dwLength))
++  // SetProcessMitigationPolicy() requires Windows 8. Callers return before
++  // getting here on earlier versions.
++  static const auto set_process_mitigation_policy =
++      reinterpret_cast<decltype(&::SetProcessMitigationPolicy)>(
++          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
++                           "SetProcessMitigationPolicy"));
++  PCHECK(set_process_mitigation_policy &&
++         set_process_mitigation_policy(policy, lpBuffer, dwLength))
+       << "SetProcessMitigationPolicy failed with Policy: " << policy;
+ 
+   return true;
+@@ -158,6 +172,11 @@ bool ApplyProcessMitigationsToCurrentProcess(MitigationFlags starting_flags,
+   }
+ #endif
+ 
++  // This is all we can do in Win7 and below.
++  if (version < base::win::Version::WIN8) {
++    return true;
++  }
++
+   // Enable ASLR policies.
+   if (flags & MITIGATION_RELOCATE_IMAGE) {
+     PROCESS_MITIGATION_ASLR_POLICY policy = {};
+@@ -359,7 +378,13 @@ bool ApplyMitigationsToCurrentThread(MitigationFlags flags) {
+     DWORD thread_policy = THREAD_DYNAMIC_CODE_ALLOW;
+ 
+     // NOTE: Must use the pseudo-handle here, a thread HANDLE won't work.
+-    if (!::SetThreadInformation(::GetCurrentThread(), ThreadDynamicCodePolicy,
++    // SetThreadInformation() is resolved at runtime because it requires
++    // Windows 8, although this is only reached on Windows 10 RS1+.
++    static const auto set_thread_information =
++        reinterpret_cast<decltype(&::SetThreadInformation)>(::GetProcAddress(
++            ::GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation"));
++    if (!set_thread_information ||
++        !set_thread_information(::GetCurrentThread(), ThreadDynamicCodePolicy,
+                                 &thread_policy, sizeof(thread_policy))) {
+       return false;
+     }
+@@ -381,8 +406,15 @@ void ConvertProcessMitigationsToPolicy(MitigationFlags flags,
+   *policy_value_1 = 0;
+   *policy_value_2 = 0;
+ 
+-#if defined(_WIN64) || defined(_M_IX86)
++#if defined(_WIN64)
+   *size = sizeof(*policy_flags);
++#elif defined(_M_IX86)
++  // A 64-bit flags attribute is illegal on 32-bit Win 7.
++  if (version < base::win::Version::WIN8) {
++    *size = sizeof(DWORD);
++  } else {
++    *size = sizeof(*policy_flags);
++  }
+ #else
+ #error This platform is not supported.
+ #endif
+@@ -400,6 +432,11 @@ void ConvertProcessMitigationsToPolicy(MitigationFlags flags,
+     *policy_value_1 |= PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE;
+ #endif
+ 
++  // Win 7 only supports DEP and SEHOP, and can't report what it supports.
++  if (version < base::win::Version::WIN8) {
++    return;
++  }
++
+   if (flags & MITIGATION_RELOCATE_IMAGE) {
+     *policy_value_1 |=
+         PROCESS_CREATION_MITIGATION_POLICY_FORCE_RELOCATE_IMAGES_ALWAYS_ON;
+@@ -572,6 +609,11 @@ void ConvertProcessMitigationsToComponentFilter(MitigationFlags flags,
+ }
+ 
+ MitigationFlags FilterPostStartupProcessMitigations(MitigationFlags flags) {
++  // Windows 7 can't set the heap mitigation at process creation.
++  if (base::win::GetVersion() < base::win::Version::WIN8) {
++    return flags & (MITIGATION_BOTTOM_UP_ASLR | MITIGATION_DLL_SEARCH_ORDER |
++                    MITIGATION_HEAP_TERMINATE);
++  }
+   return flags & (MITIGATION_BOTTOM_UP_ASLR | MITIGATION_DLL_SEARCH_ORDER);
+ }
+ 
+diff --git a/sandbox/win/src/startup_information_helper.cc b/sandbox/win/src/startup_information_helper.cc
+index fce8b014a0661cd79535bb75515682f56f05843b..74d28f7db5f1701939a5d38666c57d473e913bb5 100644
+--- a/sandbox/win/src/startup_information_helper.cc
++++ b/sandbox/win/src/startup_information_helper.cc
+@@ -87,6 +87,12 @@ void StartupInformationHelper::SetAppContainer(AppContainer* container) {
+ }
+ 
+ void StartupInformationHelper::AddJobToAssociate(HANDLE job_handle) {
++  // PROC_THREAD_ATTRIBUTE_JOB_LIST requires Windows 10. Before that, the
++  // suspended process is assigned to the job after it's created.
++  if (base::win::GetVersion() < base::win::Version::WIN10) {
++    job_to_assign_after_creation_ = job_handle;
++    return;
++  }
+   job_handle_list_.push_back(job_handle);
+ }
+ 
+diff --git a/sandbox/win/src/startup_information_helper.h b/sandbox/win/src/startup_information_helper.h
+index 2c6d6b3a8caad524342985c46957d18550c0830b..6db5aa3aa5ee72571a4a00ddfaf0891725330236 100644
+--- a/sandbox/win/src/startup_information_helper.h
++++ b/sandbox/win/src/startup_information_helper.h
+@@ -49,6 +49,12 @@ class StartupInformationHelper {
+ 
+   // Will one or more jobs be associated via the wrapped StartupInformation.
+   bool HasJobsToAssociate() { return !job_handle_list_.empty(); }
++
++  // Before Windows 10, the job that the process has to be assigned to once
++  // it's created, or null.
++  HANDLE job_to_assign_after_creation() const {
++    return job_to_assign_after_creation_;
++  }
+   // Have handles been provided for secure inheritance?
+   bool ShouldInheritHandles() { return inherit_handles_; }
+ 
+@@ -99,6 +105,7 @@ class StartupInformationHelper {
+   DWORD all_applications_package_policy_ = 0;
+   std::vector<HANDLE> inherited_handle_list_;
+   std::vector<HANDLE> job_handle_list_;
++  HANDLE job_to_assign_after_creation_ = nullptr;
+   std::unique_ptr<SecurityCapabilities> security_capabilities_;
+ };
+ }  // namespace sandbox
