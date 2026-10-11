@@ -18,7 +18,7 @@ This patch is needed for Windows 7 support and is not suitable for
 upstreaming.
 
 diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
-index daeb9327d28fab06bcb1375606e18419063850d6..f2c904fb3aa0bb1a4f2b814839f83bff3f70917c 100644
+index daeb9327d28fab06bcb1375606e18419063850d6..d70057cf3785a343df539754c9d6878332fddb2e 100644
 --- a/sandbox/policy/win/sandbox_win.cc
 +++ b/sandbox/policy/win/sandbox_win.cc
 @@ -639,7 +639,13 @@ ResultCode LaunchWithoutSandbox(
@@ -47,6 +47,25 @@ index daeb9327d28fab06bcb1375606e18419063850d6..f2c904fb3aa0bb1a4f2b814839f83bff
    if (cmd_line.HasSwitch(switches::kNoSandbox))
      return true;
    if (launcher_process_command_line.HasSwitch(switches::kNoSandbox))
+@@ -972,9 +982,17 @@ ResultCode SandboxWin::StartSandboxedProcess(
+   // Avoid making a policy if we won't use it.
+   if (IsUnsandboxedProcess(delegate->GetSandboxType(), cmd_line,
+                            *base::CommandLine::ForCurrentProcess())) {
++    // Child processes always run unsandboxed on Windows 7 (see
++    // IsUnsandboxedProcess()). Tell them so, or processes that expect a
++    // sandbox, like renderers, fail to enable it and exit.
++    base::CommandLine child_cmd_line = cmd_line;
++    if (base::win::GetVersion() < base::win::Version::WIN8 &&
++        !child_cmd_line.HasSwitch(switches::kNoSandbox)) {
++      child_cmd_line.AppendSwitch(switches::kNoSandbox);
++    }
+     base::Process process;
+     ResultCode result =
+-        LaunchWithoutSandbox(cmd_line, *options, delegate, &process);
++        LaunchWithoutSandbox(child_cmd_line, *options, delegate, &process);
+     DWORD last_error = GetLastError();
+     std::move(result_callback).Run(std::move(process), last_error, result);
+     return SBOX_ALL_OK;
 diff --git a/sandbox/win/src/process_mitigations.cc b/sandbox/win/src/process_mitigations.cc
 index 38ae75ee7b2b9716b3f7c57b6f9c74a67a911d7b..beb590a7620159dca8f20e76f991db5ff010979a 100644
 --- a/sandbox/win/src/process_mitigations.cc
