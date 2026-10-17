@@ -1,0 +1,315 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 22:41:47 -0400
+Subject: fix: broker shared memory for sandboxed processes on Windows 7
+
+Sandboxed processes cannot create sections themselves before Windows 8.1,
+so renderers and the GPU process failed every shared memory allocation
+and were killed as out of memory. Chromium brokered these allocations
+through the browser before dropping Windows 7, but MojoIpcz only
+implements that service on POSIX.
+
+Restore brokering below Windows 8.1: the browser passes each child a
+dedicated pipe at launch and serves allocation requests over it with
+the existing Broker and BrokerHost, and sandboxed children install the
+shared memory hooks to use it.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/content/app/initialize_mojo_core.cc b/content/app/initialize_mojo_core.cc
+index 2c21dd0d8e4326020ee5800a40d64c70453def5b..fb714c793e4b98a35b827aff7aa4ba23f8c480f9 100644
+--- a/content/app/initialize_mojo_core.cc
++++ b/content/app/initialize_mojo_core.cc
+@@ -18,6 +18,10 @@
+ #include "mojo/public/cpp/platform/platform_channel.h"
+ #include "sandbox/policy/sandbox_type.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include "base/win/windows_version.h"
++#endif
++
+ namespace content {
+ 
+ void InitializeMojoCore() {
+@@ -43,9 +47,12 @@ void InitializeMojoCore() {
+       config.force_direct_shared_memory_allocation = true;
+   } else {
+ #if BUILDFLAG(IS_WIN)
+-    // On Windows it's not necessary to broker shared memory allocation, as
+-    // even sandboxed processes can allocate their own without trouble.
+-    config.force_direct_shared_memory_allocation = true;
++    // On Windows 8.1 and later it's not necessary to broker shared memory
++    // allocation, as even sandboxed processes can allocate their own without
++    // trouble.
++    if (base::win::GetVersion() >= base::win::Version::WIN8_1) {
++      config.force_direct_shared_memory_allocation = true;
++    }
+ #endif
+   }
+ 
+@@ -74,9 +81,22 @@ void InitializeMojoCore() {
+     // Sanity check, since installing the shared memory hooks in a broker
+     // process will lead to infinite recursion.
+     DCHECK(!config.is_broker_process);
++#if BUILDFLAG(IS_WIN)
++    // Before Windows 8.1, the browser passes a pipe to request shared memory
++    // through. Without one, fall back to allocating directly.
++    mojo::PlatformChannelEndpoint broker_endpoint =
++        mojo::PlatformChannel::RecoverPassedEndpointFromString(
++            command_line.GetSwitchValueASCII(
++                switches::kMojoSharedMemoryBrokerHandle));
++    if (broker_endpoint.is_valid()) {
++      mojo::core::SetBaseSharedMemoryBrokerEndpoint(std::move(broker_endpoint));
++      mojo::SharedMemoryUtils::InstallBaseHooks();
++    }
++#else
+     // Otherwise, this is a sandboxed process that will need brokering to
+     // allocate shared memory.
+     mojo::SharedMemoryUtils::InstallBaseHooks();
++#endif
+   }
+ #endif  // !BUILDFLAG(IS_APPLE) && !BUILDFLAG(IS_FUCHSIA)
+ }
+diff --git a/content/browser/child_process_launcher_helper.cc b/content/browser/child_process_launcher_helper.cc
+index b3e40a8ae3608bf56e6b47b7da4044c4c06500f8..4d17d2d7439ee5b84da01bcc5cbb29eddc877572 100644
+--- a/content/browser/child_process_launcher_helper.cc
++++ b/content/browser/child_process_launcher_helper.cc
+@@ -34,6 +34,7 @@
+ #include "content/public/common/content_features.h"
+ #include "content/public/common/content_switches.h"
+ #include "mojo/core/configuration.h"
++#include "mojo/core/embedder/embedder.h"
+ #include "mojo/public/cpp/platform/platform_channel.h"
+ #include "services/tracing/public/cpp/trace_startup.h"
+ 
+@@ -388,6 +389,18 @@ void ChildProcessLauncherHelper::PostLaunchOnLauncherThread(
+   if (mojo_channel_)
+     mojo_channel_->RemoteProcessLaunchAttempted();
+ 
++#if BUILDFLAG(IS_WIN)
++  if (mojo_shared_memory_broker_channel_) {
++    mojo_shared_memory_broker_channel_->RemoteProcessLaunchAttempted();
++    if (process.process.IsValid()) {
++      mojo::core::CreateBaseSharedMemoryBrokerHost(
++          process.process.Duplicate(),
++          mojo_shared_memory_broker_channel_->TakeLocalEndpoint());
++    }
++    mojo_shared_memory_broker_channel_.reset();
++  }
++#endif
++
+   if (process.process.IsValid()) {
+     RecordHistogramsOnLauncherThread(base::TimeTicks::Now() -
+                                      begin_launch_time_);
+diff --git a/content/browser/child_process_launcher_helper.h b/content/browser/child_process_launcher_helper.h
+index 2115126485d3871a0dc68b82bda5fadf1d22f6f7..777f6a2c670f944cd64bf65763f46d415e08c9af 100644
+--- a/content/browser/child_process_launcher_helper.h
++++ b/content/browser/child_process_launcher_helper.h
+@@ -330,6 +330,12 @@ class ChildProcessLauncherHelper
+   std::optional<mojo::NamedPlatformChannel> mojo_named_channel_;
+ #endif
+ 
++#if BUILDFLAG(IS_WIN)
++  // Before Windows 8.1, the pipe a sandboxed child uses to ask the browser for
++  // shared memory, since it cannot create sections itself.
++  std::optional<mojo::PlatformChannel> mojo_shared_memory_broker_channel_;
++#endif
++
+   bool terminate_on_shutdown_;
+   mojo::OutgoingInvitation mojo_invitation_;
+   const mojo::ProcessErrorCallback process_error_callback_;
+diff --git a/content/browser/child_process_launcher_helper_win.cc b/content/browser/child_process_launcher_helper_win.cc
+index 4f39415717f423b9a87f83779851e08bf5481b8c..eb16458be8bdfd0f15983bf85e2603ebcd5b2d56 100644
+--- a/content/browser/child_process_launcher_helper_win.cc
++++ b/content/browser/child_process_launcher_helper_win.cc
+@@ -135,6 +135,14 @@ bool ChildProcessLauncherHelper::BeforeLaunchOnLauncherThread(
+   if (!options->elevated) {
+     mojo_channel_->PrepareToPassRemoteEndpoint(&options->handles_to_inherit,
+                                                command_line());
++    if (base::win::GetVersion() < base::win::Version::WIN8_1) {
++      std::string value;
++      mojo_shared_memory_broker_channel_.emplace();
++      mojo_shared_memory_broker_channel_->PrepareToPassRemoteEndpoint(
++          &options->handles_to_inherit, &value);
++      command_line()->AppendSwitchASCII(switches::kMojoSharedMemoryBrokerHandle,
++                                        value);
++    }
+   }
+ 
+   if (file_data_->stdout_handle.is_valid() || file_data_->stderr_handle.is_valid()) {
+diff --git a/content/public/common/content_switches.cc b/content/public/common/content_switches.cc
+index 86755253c2d71135b99c745704c653d2a5344812..2abdb8d2672ceea9e975ef01e08eaa69dab84c6e 100644
+--- a/content/public/common/content_switches.cc
++++ b/content/public/common/content_switches.cc
+@@ -961,6 +961,10 @@ const char kDisableLegacyIntermediateWindow[] = "disable-legacy-window";
+ // This switch allows us to pass the shared memory handle to the renderer.
+ const char kFontCacheSharedHandle[] = "font-cache-shared-handle";
+ 
++// Sandboxed processes cannot create shared memory sections before Windows 8.1,
++// so the browser passes each child a pipe to request them through instead.
++const char kMojoSharedMemoryBrokerHandle[] = "mojo-shared-memory-broker-handle";
++
+ // Raise the timer interrupt frequency in all Chrome processes, for experimental
+ // purposes. This feature is needed because as of Windows 10 2004 the scheduling
+ // effects of changing the timer interrupt frequency are not global, and this
+diff --git a/content/public/common/content_switches.h b/content/public/common/content_switches.h
+index 7aa438442227c1d07a2abf63d14b36355bec50ff..663a2f65c6f5da772d73d84824441226196d3522 100644
+--- a/content/public/common/content_switches.h
++++ b/content/public/common/content_switches.h
+@@ -272,6 +272,8 @@ CONTENT_EXPORT extern const char kDeviceScaleFactor[];
+ CONTENT_EXPORT extern const char kDisableLegacyIntermediateWindow[];
+ // Switch to pass the font cache shared memory handle to the renderer.
+ CONTENT_EXPORT extern const char kFontCacheSharedHandle[];
++// Switch to pass the shared memory broker pipe to children before Windows 8.1.
++CONTENT_EXPORT extern const char kMojoSharedMemoryBrokerHandle[];
+ CONTENT_EXPORT extern const char kRaiseTimerFrequency[];
+ CONTENT_EXPORT extern const char kGpu2StartupDialog[];
+ CONTENT_EXPORT extern const char kAudioProcessHighPriority[];
+diff --git a/mojo/core/embedder/embedder.cc b/mojo/core/embedder/embedder.cc
+index 2da958761cc5f4835d990813beff5be94b9904d5..6a09c42684b20742bf5d8ab46cee12168df04f64 100644
+--- a/mojo/core/embedder/embedder.cc
++++ b/mojo/core/embedder/embedder.cc
+@@ -196,6 +196,21 @@ void InstallMojoIpczBaseSharedMemoryHooks() {
+   ipcz_driver::BaseSharedMemoryService::InstallHooks();
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++void CreateBaseSharedMemoryBrokerHost(base::Process client_process,
++                                      PlatformChannelEndpoint endpoint) {
++  DCHECK(IsMojoIpczEnabled());
++  ipcz_driver::BaseSharedMemoryService::CreateWindowsService(
++      std::move(client_process), std::move(endpoint));
++}
++
++void SetBaseSharedMemoryBrokerEndpoint(PlatformChannelEndpoint endpoint) {
++  DCHECK(IsMojoIpczEnabled());
++  ipcz_driver::BaseSharedMemoryService::CreateWindowsClient(
++      std::move(endpoint));
++}
++#endif
++
+ const IpczAPI& GetIpczAPIForMojo() {
+   return GetIpczAPI();
+ }
+diff --git a/mojo/core/embedder/embedder.h b/mojo/core/embedder/embedder.h
+index a6e4f07ce467e559df6bb73e41d67d0736966384..025ac18250e61308779fd3ffe53aaace8eecbfe5 100644
+--- a/mojo/core/embedder/embedder.h
++++ b/mojo/core/embedder/embedder.h
+@@ -69,6 +69,18 @@ COMPONENT_EXPORT(MOJO_CORE_EMBEDDER) bool IsMojoIpczEnabled();
+ COMPONENT_EXPORT(MOJO_CORE_EMBEDDER)
+ void InstallMojoIpczBaseSharedMemoryHooks();
+ 
++#if BUILDFLAG(IS_WIN)
++// Sandboxed processes cannot create their own shared memory before Windows
++// 8.1. Serves base shared memory allocation requests from `client_process`
++// over `endpoint`, whose other end the child passes to
++// SetBaseSharedMemoryBrokerEndpoint() before installing the hooks above.
++COMPONENT_EXPORT(MOJO_CORE_EMBEDDER)
++void CreateBaseSharedMemoryBrokerHost(base::Process client_process,
++                                      PlatformChannelEndpoint endpoint);
++COMPONENT_EXPORT(MOJO_CORE_EMBEDDER)
++void SetBaseSharedMemoryBrokerEndpoint(PlatformChannelEndpoint endpoint);
++#endif
++
+ // These functions expose the IpczAPI and IpczDriver structures used internally
+ // by the Mojo Core implementation when MojoIpcz is enabled.
+ COMPONENT_EXPORT(MOJO_CORE_EMBEDDER) const IpczAPI& GetIpczAPIForMojo();
+diff --git a/mojo/core/ipcz_driver/base_shared_memory_service.cc b/mojo/core/ipcz_driver/base_shared_memory_service.cc
+index c56620189d93e48263d5f713c7be631f9df5eb68..ecc15c58f7500d0cab59fdd45d9a75230fa979f7 100644
+--- a/mojo/core/ipcz_driver/base_shared_memory_service.cc
++++ b/mojo/core/ipcz_driver/base_shared_memory_service.cc
+@@ -110,6 +110,20 @@ Broker* g_client = nullptr;
+ 
+ #endif  // SHARED_MEMORY_SERVICE_REQUIRED()
+ 
++#if BUILDFLAG(IS_WIN)
++
++void CreateWindowsBrokerHostOnIOThread(base::Process client_process,
++                                       PlatformChannelEndpoint endpoint) {
++  // Self-owned. BrokerHost duplicates each section it allocates into
++  // `client_process`.
++  new BrokerHost(std::move(client_process),
++                 ConnectionParams(std::move(endpoint)), base::NullCallback());
++}
++
++Broker* g_windows_client = nullptr;
++
++#endif  // BUILDFLAG(IS_WIN)
++
+ base::WritableSharedMemoryRegion CreateWritableSharedMemoryRegion(size_t size) {
+   return BaseSharedMemoryService::CreateWritableRegion(size);
+ }
+@@ -181,6 +195,11 @@ base::WritableSharedMemoryRegion BaseSharedMemoryService::CreateWritableRegion(
+     return {};
+   }
+   return g_client->GetWritableSharedMemoryRegion(size);
++#elif BUILDFLAG(IS_WIN)
++  if (!g_windows_client) {
++    return {};
++  }
++  return g_windows_client->GetWritableSharedMemoryRegion(size);
+ #else
+   // The shared memory service is not needed on other platforms, so this method
+   // should never be called.
+@@ -188,4 +207,25 @@ base::WritableSharedMemoryRegion BaseSharedMemoryService::CreateWritableRegion(
+ #endif
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++// static
++void BaseSharedMemoryService::CreateWindowsService(
++    base::Process client_process,
++    PlatformChannelEndpoint endpoint) {
++  Transport::GetIOTaskRunner()->PostTask(
++      FROM_HERE, base::BindOnce(&CreateWindowsBrokerHostOnIOThread,
++                                std::move(client_process), std::move(endpoint)));
++}
++
++// static
++void BaseSharedMemoryService::CreateWindowsClient(
++    PlatformChannelEndpoint endpoint) {
++  DCHECK(!g_windows_client);
++  if (endpoint.is_valid()) {
++    g_windows_client = new Broker(endpoint.TakePlatformHandle(),
++                                  /*wait_for_channel_handle=*/false);
++  }
++}
++#endif  // BUILDFLAG(IS_WIN)
++
+ }  // namespace mojo::core::ipcz_driver
+diff --git a/mojo/core/ipcz_driver/base_shared_memory_service.h b/mojo/core/ipcz_driver/base_shared_memory_service.h
+index 5cfcb5462550a70a696cb3b5401c735a647fabb0..6aeec59c582546d292469ee2428a1cde8aaba2eb 100644
+--- a/mojo/core/ipcz_driver/base_shared_memory_service.h
++++ b/mojo/core/ipcz_driver/base_shared_memory_service.h
+@@ -6,8 +6,11 @@
+ #define MOJO_CORE_IPCZ_DRIVER_BASE_SHARED_MEMORY_SERVICE_H_
+ 
+ #include "base/memory/writable_shared_memory_region.h"
++#include "base/process/process.h"
++#include "build/build_config.h"
+ #include "mojo/core/scoped_ipcz_handle.h"
+ #include "mojo/core/system_impl_export.h"
++#include "mojo/public/cpp/platform/platform_channel_endpoint.h"
+ #include "third_party/ipcz/include/ipcz/ipcz.h"
+ 
+ namespace mojo::core::ipcz_driver {
+@@ -45,6 +48,18 @@ class MOJO_SYSTEM_IMPL_EXPORT BaseSharedMemoryService {
+   // global client object to issue a request and block on its response. If
+   // allocation fails for any reason, this returns an invalid region.
+   static base::WritableSharedMemoryRegion CreateWritableRegion(size_t size);
++
++#if BUILDFLAG(IS_WIN)
++  // Sandboxed processes cannot create their own sections before Windows 8.1,
++  // so the browser passes each child a dedicated pipe at launch and serves
++  // allocation requests over it. Creates the service end for
++  // `client_process`, which manages its own lifetime on the IO thread.
++  static void CreateWindowsService(base::Process client_process,
++                                   PlatformChannelEndpoint endpoint);
++
++  // Creates the singleton client object for the pipe passed at launch.
++  static void CreateWindowsClient(PlatformChannelEndpoint endpoint);
++#endif
+ };
+ 
+ }  // namespace mojo::core::ipcz_driver
