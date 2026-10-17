@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 08:37:21 -0400
+Subject: build: support a macOS 10.13 deployment target
+
+Chromium only builds for its own minimum macOS version. Fix the code that
+fails to build when targeting macOS 10.13, mostly by checking the
+availability of APIs added in later versions at runtime.
+
+On x64, PAGE_SIZE is a signed constant rather than vm_page_size when
+targeting macOS versions older than 11, so check it with a static assert
+as is already done for iOS on x86, and widen it before multiplying by
+32-bit page counts so system memory info doesn't wrap above 4 GB.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/base/process/process_metrics_apple.mm b/base/process/process_metrics_apple.mm
+index 2ffa8eb31094af7b7f9353126e07140e82f7dc5e..8beb58cd5114a46175869d6a0c686c520edad96c 100644
+--- a/base/process/process_metrics_apple.mm
++++ b/base/process/process_metrics_apple.mm
+@@ -250,7 +250,7 @@ size_t GetSystemCommitCharge() {
+     return 0;
+   }
+ 
+-  return (data.active_count * PAGE_SIZE) / 1024;
++  return (data.active_count * static_cast<uint64_t>(PAGE_SIZE)) / 1024;
+ }
+ 
+ bool GetSystemMemoryInfo(SystemMemoryInfo* meminfo) {
+@@ -266,7 +266,9 @@ bool GetSystemMemoryInfo(SystemMemoryInfo* meminfo) {
+   }
+   DCHECK_GE(count, HOST_VM_INFO64_REV1_COUNT);
+ 
+-#if !(BUILDFLAG(IS_IOS) && defined(ARCH_CPU_X86_FAMILY))
++#if !(BUILDFLAG(IS_IOS) && defined(ARCH_CPU_X86_FAMILY)) && \
++    !(BUILDFLAG(IS_MAC) && defined(ARCH_CPU_X86_FAMILY) &&  \
++      __MAC_OS_X_VERSION_MIN_REQUIRED < 101600)
+   // PAGE_SIZE (aka vm_page_size) isn't constexpr, so this check needs to be
+   // done at runtime.
+   DCHECK_EQ(PAGE_SIZE % 1024, 0u) << "Invalid page size";
+@@ -291,16 +293,21 @@ bool GetSystemMemoryInfo(SystemMemoryInfo* meminfo) {
+   //
+   // Therefore, when building for "iOS on x86", which is either Mac Catalyst or
+   // the iOS Simulator, use a static assert that assumes that PAGE_SIZE is a
+-  // signed constant value.
++  // signed constant value. The same applies to x64 builds that target macOS
++  // versions older than 11.
+   //
+   // TODO(Chrome iOS team): Remove this entire #else branch when the Mac
+   // Catalyst and the iOS Simulator builds only target Arm Macs.
+   static_assert(PAGE_SIZE % 1024 == 0, "Invalid page size");
+ #endif  // !(defined(IS_IOS) && defined(ARCH_CPU_X86_FAMILY))
+ 
++  // When PAGE_SIZE is a signed constant, multiplying it by a 32-bit page count
++  // would overflow above 4 GB, so widen it first.
++  const uint64_t page_size = PAGE_SIZE;
++
+   if (vm_info.speculative_count <= vm_info.free_count) {
+     meminfo->free =
+-        ByteSize(PAGE_SIZE * (vm_info.free_count - vm_info.speculative_count));
++        ByteSize(page_size * (vm_info.free_count - vm_info.speculative_count));
+   } else {
+     // Inside the `host_statistics64` call above, `speculative_count` is
+     // computed later than `free_count`, so these values are snapshots of two
+@@ -316,9 +323,9 @@ bool GetSystemMemoryInfo(SystemMemoryInfo* meminfo) {
+     meminfo->free = ByteSize(0);
+   }
+ 
+-  meminfo->speculative = ByteSize(PAGE_SIZE * vm_info.speculative_count);
+-  meminfo->file_backed = ByteSize(PAGE_SIZE * vm_info.external_page_count);
+-  meminfo->purgeable = ByteSize(PAGE_SIZE * vm_info.purgeable_count);
++  meminfo->speculative = ByteSize(page_size * vm_info.speculative_count);
++  meminfo->file_backed = ByteSize(page_size * vm_info.external_page_count);
++  meminfo->purgeable = ByteSize(page_size * vm_info.purgeable_count);
+ 
+   return true;
+ }
