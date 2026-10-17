@@ -50,9 +50,13 @@ if (is_mac) {
   import("//third_party/icu/config.gni")
   import("build/rules.gni")
 
-  assert(
-      mac_deployment_target == "13.0",
-      "Chromium has updated the mac_deployment_target, please update this assert and flag this as a breaking change (docs/breaking-changes.md)")
+  if (target_cpu == "arm64") {
+    assert(mac_deployment_target == "11.0",
+           "Apple Silicon requires a macOS 11.0 deployment target")
+  } else {
+    assert(mac_deployment_target == "10.13",
+           "Intel builds require a 10.13 deployment target for legacy macOS support")
+  }
 }
 
 if (is_linux) {

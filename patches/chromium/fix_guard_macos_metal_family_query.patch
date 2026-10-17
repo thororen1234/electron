@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron <electron@github.com>
+Date: Fri, 16 Oct 2026 00:00:00 -0400
+Subject: fix: guard Metal GPU-family query on older macOS
+
+MTLDevice's supportsFamily: API is unavailable before macOS 10.15. Chromium
+collects this GPU information during GPU process startup, even when ANGLE's
+Metal backend is not selected, so guard the query on older systems.
+
+diff --git a/gpu/config/gpu_info_collector_mac.mm b/gpu/config/gpu_info_collector_mac.mm
+index 9a98c42..9a98c42 100644
+--- a/gpu/config/gpu_info_collector_mac.mm
++++ b/gpu/config/gpu_info_collector_mac.mm
+@@ -35,8 +35,10 @@ enum class MetalFamilyMac {
+ };
+ 
+ MetalFamilyMac GetMetalFamilyMac(id<MTLDevice> device) {
+-  if ([device supportsFamily:MTLGPUFamilyMac2]) {
+-    return MetalFamilyMac::kMac2;
++  if (@available(macOS 10.15, *)) {
++    if ([device supportsFamily:MTLGPUFamilyMac2]) {
++      return MetalFamilyMac::kMac2;
++    }
+   }
+   return MetalFamilyMac::kMac1;
+ }
+-- 
+2.50.0

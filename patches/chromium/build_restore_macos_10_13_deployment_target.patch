@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron <electron@github.com>
+Date: Fri, 16 Oct 2026 00:00:00 -0400
+Subject: build: restore macOS 10.13 deployment target
+
+Keep Chromium's binary and bundle minimum aligned with Electron's legacy
+macOS target. This only changes the build and launch minimum; older runtime
+compatibility still depends on Chromium API availability.
+
+diff --git a/build/config/mac/mac_sdk.gni b/build/config/mac/mac_sdk.gni
+index d7c18c6..ca53d16 100644
+--- a/build/config/mac/mac_sdk.gni
++++ b/build/config/mac/mac_sdk.gni
+@@ -26,14 +26,14 @@
+   # separately from `mac_min_system_version` when dropping support for older
+   # macOSes.
+-  mac_deployment_target = "13.0"
++  mac_deployment_target = target_cpu == "arm64" ? "11.0" : "10.13"
+ 
+   # The value of the `LSMinimumSystemVersion` in `Info.plist` files. This value
+   # controls the minimum OS version that may launch the application, and OS
+   # releases older than this will refuse to launch the application. When
+   # dropping support for older macOSes, this variable is often changed before
+   # `mac_deployment_target` to increase the system requirement without changing
+   # how Chromium is compiled. This must be greater than or equal to the
+   # `mac_deployment_target` version.
+-  mac_min_system_version = "13.0"
++  mac_min_system_version = target_cpu == "arm64" ? "11.0" : "10.13"
+ 
+   # Path to a specific version of the Mac SDK, not including a slash at the end.
+-- 
+2.50.0

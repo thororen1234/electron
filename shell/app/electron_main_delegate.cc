@@ -59,7 +59,9 @@
 #include "v8/include/v8-snapshot.h"
 
 #if BUILDFLAG(IS_MAC)
+#include "base/mac/mac_util.h"
 #include "shell/app/electron_main_delegate_mac.h"
+#include "ui/gl/gl_switches.h"
 #endif
 
 #if BUILDFLAG(IS_WIN)
@@ -179,6 +181,31 @@ ElectronMainDelegate::GetNonWildcardDomainNonPortSchemes() {
 
 std::optional<int> ElectronMainDelegate::BasicStartupComplete() {
   auto* command_line = base::CommandLine::ForCurrentProcess();
+
+#if BUILDFLAG(IS_MAC)
+  // Chromium 152's default macOS graphics path targets the macOS 13 baseline.
+  // Preserve an older-OS path with ANGLE's desktop OpenGL backend unless the
+  // app explicitly selected a backend.
+  if (base::mac::MacOSMajorVersion() < 13 &&
+      !command_line->HasSwitch(::switches::kUseANGLE)) {
+    command_line->AppendSwitchASCII(
+        ::switches::kUseANGLE, gl::kANGLEImplementationOpenGLName);
+  }
+
+  // Dawn's Metal feature discovery uses -[MTLDevice supportsFamily:], which
+  // is only available starting in macOS 10.15. Keep WebGPU unavailable on
+  // High Sierra and Mojave rather than sending those systems through an
+  // unsupported Metal path.
+  if (base::mac::MacOSVersion() < 10'15'00) {
+    std::string disabled_features =
+        command_line->GetSwitchValueASCII(::switches::kDisableFeatures);
+    if (!disabled_features.empty())
+      disabled_features.push_back(',');
+    disabled_features += "WebGPUService";
+    command_line->AppendSwitchASCII(::switches::kDisableFeatures,
+                                    disabled_features);
+  }
+#endif
 
 #if BUILDFLAG(IS_WIN)
   v8_crashpad_support::SetUp();

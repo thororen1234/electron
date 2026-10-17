@@ -70,11 +70,13 @@ def main(target_file, target_cpu, v8_enable_cppgc_microtask_queue):
   # for native module builds are expressed as gyp conditions rather than baked.
   v.pop('clang', None)
   v.setdefault('conditions', []).append(['OS=="mac"', {'clang%': 1}])
-  # Evaluated after common.gypi's own conditions so it wins; keeps native
-  # modules loadable on macOS 13.0 - 13.4, which Chromium still supports.
+  # Evaluated after common.gypi's own conditions so native modules use the
+  # same minimum macOS version as Electron.
+  mac_deployment_target = '11.0' if target_cpu == 'arm64' else '10.13'
   config.setdefault('target_defaults', {}).setdefault(
       'target_conditions', []).append(
-          ['OS=="mac"', {'xcode_settings': {'MACOSX_DEPLOYMENT_TARGET': '13.0'}}])
+          ['OS=="mac"', {'xcode_settings': {
+              'MACOSX_DEPLOYMENT_TARGET': mac_deployment_target}}])
 
   # JSON rather than pprint: node-gyp reads this file by swapping quote
   # characters, which only round-trips the condition strings in this form.

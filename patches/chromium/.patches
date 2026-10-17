@@ -1,4 +1,6 @@
 build_gn.patch
+build_restore_macos_10_13_deployment_target.patch
+fix_guard_macos_metal_family_query.patch
 build_resolve_pgo_profiles_from_electron_state_files.patch
 accelerator.patch
 blink_local_frame.patch

@@ -58,12 +58,14 @@ app.on('select-client-certificate', (event, webContents, url, list, callback) =>
 })
 ```
 
-### Removed: macOS 12 support
+### macOS 10.13 through 12 support restored by this branch
 
-macOS 12 (Monterey) is no longer supported by [Chromium](https://chromium-review.googlesource.com/c/chromium/src/+/7907086).
-
-Older versions of Electron will continue to run on Monterey, but macOS 13 (Ventura)
-or later will be required to run Electron v44.0.0 and higher.
+This branch lowers the Intel build and launch minimum to macOS 10.13 (High
+Sierra), keeps Apple Silicon at macOS 11, and selects ANGLE's desktop OpenGL
+backend on macOS versions below 13. WebGPU is disabled on macOS 10.13 and 10.14
+because Chromium's Metal feature queries require macOS 10.15 or later. Runtime
+compatibility still needs validation against the other APIs and features used by
+this Chromium revision.
 
 ### Behavior Changed: ANGLE is statically linked on all platforms
 
@@ -1318,10 +1320,10 @@ app.on('child-process-gone', (event, details) => {
 
 ### Removed: macOS 10.13 / 10.14 support
 
-macOS 10.13 (High Sierra) and macOS 10.14 (Mojave) are no longer supported by [Chromium](https://chromium-review.googlesource.com/c/chromium/src/+/4629466).
+Upstream Chromium removed support for macOS 10.13 (High Sierra) and macOS 10.14 (Mojave) in [this change](https://chromium-review.googlesource.com/c/chromium/src/+/4629466). This branch lowers the build and launch minimum again; runtime compatibility on these versions is not guaranteed without testing.
 
 Older versions of Electron will continue to run on these operating systems, but macOS 10.15 (Catalina)
-or later will be required to run Electron v27.0.0 and higher.
+or later was required by upstream Electron v27.0.0 and higher.
 
 ### Deprecated: `ipcRenderer.sendTo()`
 

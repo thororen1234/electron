@@ -1,6 +1,16 @@
 is_electron_build = true
 root_extra_deps = [ "//electron" ]
 
+# Keep Intel builds runnable on High Sierra through Monterey. Apple Silicon
+# requires macOS 11 or later, so retain its native minimum.
+if (target_cpu == "arm64") {
+  mac_deployment_target = "11.0"
+  mac_min_system_version = "11.0"
+} else {
+  mac_deployment_target = "10.13"
+  mac_min_system_version = "10.13"
+}
+
 # Registry of NMVs --> https://github.com/nodejs/node/blob/main/doc/abi_version_registry.json
 node_module_version = 149
 
