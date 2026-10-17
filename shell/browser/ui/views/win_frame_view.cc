@@ -12,6 +12,7 @@
 #include <dwmapi.h>
 #include <memory>
 
+#include "base/win/windows_version.h"
 #include "shell/browser/native_window_views.h"
 #include "shell/browser/ui/views/win_caption_button_container.h"
 #include "ui/base/metadata/metadata_impl_macros.h"
@@ -297,6 +298,12 @@ int WinFrameView::ResizingBorderHitTest(const gfx::Point& point) {
 
 gfx::Insets WinFrameView::RestoredFrameBorderInsets() const {
   if (window_->has_frame() || !window_->has_thick_frame())
+    return {};
+
+  // Resize borders are only invisible from Windows 10 on. On older versions
+  // they would draw a visible frame around the window, so keep the resize
+  // targets inside it instead.
+  if (base::win::GetVersion() < base::win::Version::WIN10)
     return {};
 
   // TODO(mitchchn): despite the name, this method gives the correct

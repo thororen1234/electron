@@ -122,7 +122,10 @@ bool ElectronDesktopWindowTreeHostWin::GetClientAreaInsets(
                             ::GetSystemMetrics(SM_CXPADDEDBORDER);
       *insets = gfx::Insets::TLBR(thickness, thickness, thickness, thickness);
       return true;
-    } else if (native_window_view_->has_thick_frame()) {
+    } else if (native_window_view_->has_thick_frame() &&
+               base::win::GetVersion() >= base::win::Version::WIN10) {
+      // Before Windows 10 the resize borders are visible, so this would draw
+      // a frame around the window. See WinFrameView::RestoredFrameBorderInsets.
       // Grow the insets to support resize targets past the frame edge like in
       // windows with standard frames. Non-resizable windows still get input
       // insets for stable bounds and so they can be dragged from outer edges,
