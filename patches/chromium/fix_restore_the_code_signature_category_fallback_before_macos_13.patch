@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:09:53 -0400
+Subject: fix: restore the code signature category fallback before macOS 13
+
+CS_OPS_VALIDATION_CATEGORY is only supported from macOS 13. On older
+versions, derive the validation category through Security.framework as
+Chromium did before it dropped macOS 12, rather than treating every
+process as unsigned.
+
+This patch is needed for macOS 10.13 through 12 support and is not
+suitable for upstreaming.
+
+diff --git a/base/mac/process_requirement.cc b/base/mac/process_requirement.cc
+index 188023e09b744c46ceb3c2a05bd9a9cb07f3053b..c412dba964303ddac9ffd70f12ced4f50bff278f 100644
+--- a/base/mac/process_requirement.cc
++++ b/base/mac/process_requirement.cc
+@@ -87,6 +87,12 @@ struct CSOpsSystemCallProviderImpl
+             size_t usersize) override {
+     return ::csops(pid, ops, useraddr, usersize);
+   }
++
++  bool SupportsValidationCategory() const override {
++    // macOS versions prior to macOS 13 do not support
++    // CS_OPS_VALIDATION_CATEGORY.
++    return MacOSMajorVersion() >= 13;
++  }
+ };
+ 
+ ProcessRequirement::CSOpsSystemCallProvider* DefaultCSOpsProvider() {
+@@ -282,16 +288,28 @@ ProcessRequirement::Builder::HasSameCertificateType() && {
+ 
+   has_same_certificate_type_called_ = true;
+ 
+-  auto validation_category = ValidationCategoryOfCurrentProcess();
+-  if (validation_category.has_value()) {
+-    validation_category_ = *validation_category;
+-  } else if (validation_category.error() == EINVAL) {
+-    // EINVAL on versions of macOS that support CS_OPS_VALIDATION_CATEGORY
+-    // indicates that the process is unsigned or the process has an invalid
+-    // code signature.
+-    validation_category_ = ValidationCategory::None;
++  if (CSOpsProvider()->SupportsValidationCategory()) {
++    auto validation_category = ValidationCategoryOfCurrentProcess();
++    if (validation_category.has_value()) {
++      validation_category_ = *validation_category;
++    } else if (validation_category.error() == EINVAL) {
++      // EINVAL on versions of macOS that support CS_OPS_VALIDATION_CATEGORY
++      // indicates that the process is unsigned or the process has an invalid
++      // code signature.
++      validation_category_ = ValidationCategory::None;
++    } else {
++      failed_ = true;
++    }
+   } else {
+-    failed_ = true;
++    // Older macOS versions do not support CS_OPS_VALIDATION_CATEGORY. Derive
++    // the validation category via Security.framework instead.
++    static auto validation_category =
++        FallbackValidationCategoryOfCurrentProcess();
++    if (validation_category.has_value()) {
++      validation_category_ = *validation_category;
++    } else {
++      failed_ = true;
++    }
+   }
+ 
+   return std::move(*this);
+diff --git a/base/mac/process_requirement.h b/base/mac/process_requirement.h
+index ce6f97dcbd85072129a493de58bf9577bbcb73c6..73cb8a8ee386106ed0bfdba34538abd6b980dc80 100644
+--- a/base/mac/process_requirement.h
++++ b/base/mac/process_requirement.h
+@@ -155,6 +155,7 @@ class BASE_EXPORT ProcessRequirement {
+                       unsigned int ops,
+                       void* useraddr,
+                       size_t usersize) = 0;
++    virtual bool SupportsValidationCategory() const = 0;
+   };
+ 
+   // Use `csops_provider` function in place of using the default provider which
+diff --git a/base/mac/process_requirement_unittest.cc b/base/mac/process_requirement_unittest.cc
+index 310b7387db91e0f76a8b1a89c6d356b33fb5ed43..35488eb3d7a06a7c788257da6ced6cd832462857 100644
+--- a/base/mac/process_requirement_unittest.cc
++++ b/base/mac/process_requirement_unittest.cc
+@@ -73,6 +73,12 @@ struct CSOpsSystemCallProviderForTesting
+     }
+   }
+ 
++  bool SupportsValidationCategory() const override {
++    // This test implementation supports returning the validation category on
++    // all macOS versions.
++    return true;
++  }
++
+   void SetTeamIdentifier(std::string team_id) {
+     ON_CALL(*this, GetTeamIdentifier)
+         .WillByDefault([team_id = std::move(team_id)](span<char> out_team_id) {

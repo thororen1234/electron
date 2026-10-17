@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:09:50 -0400
+Subject: fix: allow ANGLE's OpenGL backend on macOS
+
+Chromium stopped allowing ANGLE's OpenGL backend on macOS when it dropped
+macOS 12. Allow it again after Metal, so Metal stays the default and Macs
+or macOS versions that do not use Metal can select OpenGL with
+--use-angle=gl.
+
+This patch is needed for macOS 10.13 through 12 support and is not
+suitable for upstreaming.
+
+diff --git a/ui/gl/init/gl_factory_mac.cc b/ui/gl/init/gl_factory_mac.cc
+index 3cfe3a42beca96b8a1b522479d6c4f45b2a2811d..212c87dd6d17178199a7f240743a3e8df144e91a 100644
+--- a/ui/gl/init/gl_factory_mac.cc
++++ b/ui/gl/init/gl_factory_mac.cc
+@@ -26,6 +26,9 @@ namespace init {
+ std::vector<GLImplementationParts> GetAllowedGLImplementations() {
+   std::vector<GLImplementationParts> impls;
+   impls.emplace_back(gl::ANGLEImplementation::kMetal);
++  // Allowed but not the default, for Macs without Metal and macOS versions
++  // that Metal is not used on.
++  impls.emplace_back(gl::ANGLEImplementation::kOpenGL);
+   impls.emplace_back(gl::ANGLEImplementation::kSwiftShader);
+   return impls;
+ }

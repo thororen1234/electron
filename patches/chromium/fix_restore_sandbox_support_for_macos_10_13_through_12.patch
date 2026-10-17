@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:09:51 -0400
+Subject: fix: restore sandbox support for macOS 10.13 through 12
+
+Chromium made sandbox rules unconditional once it no longer supported the
+macOS versions they did not apply to. Older versions of the sandbox fail
+to compile a profile that uses filters they do not know, so guard those
+rules by OS version again.
+
+_CSCheckFixDisable() only exists from macOS 10.15. Declare its
+availability and check it at runtime so it is weakly linked, or dyld
+refuses to launch the app on older versions.
+
+This patch is needed for macOS 10.13 through 12 support and is not
+suitable for upstreaming.
+
+diff --git a/sandbox/mac/system_services.cc b/sandbox/mac/system_services.cc
+index 9921ccb10d3455600eddd85f77f10228016389af..7f33f29e19564919b9c67d01de4cae6fcbe794d9 100644
+--- a/sandbox/mac/system_services.cc
++++ b/sandbox/mac/system_services.cc
+@@ -19,7 +19,7 @@ void _LSSetApplicationLaunchServicesServerConnectionStatus(
+ 
+ // See
+ // https://github.com/WebKit/WebKit/blob/24aaedc770d192d03a07ba4a71727274aaa8fc07/Source/WebKit/WebProcess/cocoa/WebProcessCocoa.mm#L840
+-void _CSCheckFixDisable();
++void _CSCheckFixDisable() API_AVAILABLE(macosx(10.15));
+ }  // extern "C"
+ #endif
+ 
+@@ -45,7 +45,9 @@ void DisableLaunchServices() {
+ 
+ void DisableCoreServicesCheckFix() {
+ #if !IS_MAS_BUILD()
+-  _CSCheckFixDisable();
++  if (__builtin_available(macOS 10.15, *)) {
++    _CSCheckFixDisable();
++  }
+ #endif
+ }
+ 
+diff --git a/sandbox/policy/mac/common.sb b/sandbox/policy/mac/common.sb
+index f934c3093d12afdb004b2766488d934566281bea..d43fb16d9003d76fe136342ff55885f405e500ec 100644
+--- a/sandbox/policy/mac/common.sb
++++ b/sandbox/policy/mac/common.sb
+@@ -110,13 +110,14 @@
+ ; Reads of signed Mach-O blobs created by the CVMS server.
+ ; https://crbug.com/850021
+ (define (allow-cvms-blobs)
+-  (begin
+-    (allow file-read* file-write-unlink
+-      (prefix "/private/tmp/cvmsCodeSignObj"))
+-    (allow file-read*
+-      (extension "com.apple.cvms.kernel")
+-      (prefix "/private/var/db/CVMS/cvmsCodeSignObj"))
+-))
++  (if (>= os-version 1014)
++    (begin
++      (allow file-read* file-write-unlink
++        (prefix "/private/tmp/cvmsCodeSignObj"))
++      (allow file-read*
++        (extension "com.apple.cvms.kernel")
++        (prefix "/private/var/db/CVMS/cvmsCodeSignObj"))
++)))
+ 
+ ; Allow logging for all processes.
+ (allow file-write*
+@@ -240,12 +241,14 @@
+   (path "/System/Library/CoreServices/checkfixlist")
+ )
+ 
+-; From /System/Library/Sandbox/Profiles/dyld-support.sb.
+-(allow file-read* file-map-executable
+-  (subpath "/System/Cryptexes/App")
+-  (subpath "/System/Cryptexes/OS")
+-  (subpath "/System/Volumes/Preboot/Cryptexes/App/System")
+-  (subpath "/System/Volumes/Preboot/Cryptexes/OS")
++; From /System/Library/Sandbox/Profiles/dyld-support.sb on macOS 13.
++(if (>= os-version 1300)
++  (allow file-read* file-map-executable
++    (subpath "/System/Cryptexes/App")
++    (subpath "/System/Cryptexes/OS")
++    (subpath "/System/Volumes/Preboot/Cryptexes/App/System")
++    (subpath "/System/Volumes/Preboot/Cryptexes/OS")
++  )
+ )
+ 
+ ; Reads from /usr.
+diff --git a/sandbox/policy/mac/gpu.sb b/sandbox/policy/mac/gpu.sb
+index a1e0889f9154da0dcd2484e142fd317318d1d4f8..d447a5fb91d3fd11fed6e59136d98422c06e9f9c 100644
+--- a/sandbox/policy/mac/gpu.sb
++++ b/sandbox/policy/mac/gpu.sb
+@@ -39,7 +39,9 @@
+ )
+ 
+ ; Needed for metal decoding - https://crbug.com/957217
+-(allow mach-lookup (xpc-service-name "com.apple.MTLCompilerService"))
++(if (>= os-version 1014)
++  (allow mach-lookup (xpc-service-name "com.apple.MTLCompilerService"))
++)
+ 
+ ; Allow access to the Apple Neural Engine for the Shape Detection API.
+ ; https://crbug.com/1382442
+diff --git a/sandbox/policy/mac/on_device_model_execution.sb b/sandbox/policy/mac/on_device_model_execution.sb
+index 7a5cbeaa646d6d2ab0dfd5156c02aae065819599..965b079b00a99ff80e5ebf2b1b81fa15e1dbc868 100644
+--- a/sandbox/policy/mac/on_device_model_execution.sb
++++ b/sandbox/policy/mac/on_device_model_execution.sb
+@@ -12,7 +12,9 @@
+ (allow ipc-posix-shm)
+ 
+ ; Needed for metal decoding - https://crbug.com/957217
+-(allow mach-lookup (xpc-service-name "com.apple.MTLCompilerService"))
++(if (>= os-version 1014)
++  (allow mach-lookup (xpc-service-name "com.apple.MTLCompilerService"))
++)
+ 
+ (allow mach-lookup
+   (global-name "com.apple.system.opendirectoryd.membership") ; https://crbug.com/1126350#c5
+diff --git a/sandbox/policy/mac/renderer.sb b/sandbox/policy/mac/renderer.sb
+index 687bca71bdff74c14ed837907f8d44922ebce5ea..8279bce63686a47e520f1ea749c67cfcdfd40fd4 100644
+--- a/sandbox/policy/mac/renderer.sb
++++ b/sandbox/policy/mac/renderer.sb
+@@ -105,6 +105,9 @@
+ )
+ 
+ ; For V8 to use in thread calculations.
+-(allow sysctl-read (sysctl-name "kern.tcsm_enable"))
+-(allow sysctl-write (sysctl-name "kern.tcsm_enable"))
+-(allow sysctl-read (sysctl-name "kern.tcsm_available"))
++(if (>= os-version 1014)
++  (begin
++    (allow sysctl-read (sysctl-name "kern.tcsm_enable"))
++    (allow sysctl-write (sysctl-name "kern.tcsm_enable"))
++    (allow sysctl-read (sysctl-name "kern.tcsm_available"))
++))

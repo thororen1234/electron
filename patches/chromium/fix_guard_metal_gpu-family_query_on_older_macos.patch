@@ -8,10 +8,10 @@ collects this GPU information during GPU process startup, even when ANGLE's
 Metal backend is not selected, so guard the query on older systems.
 
 diff --git a/gpu/config/gpu_info_collector_mac.mm b/gpu/config/gpu_info_collector_mac.mm
-index 9a98c42..9a98c42 100644
+index c9e809ebdc8f2cba64a1a9ac1f614564d2ab159c..0b8854eeb8d28b1e2d227b977a0b7e01b45c2301 100644
 --- a/gpu/config/gpu_info_collector_mac.mm
 +++ b/gpu/config/gpu_info_collector_mac.mm
-@@ -35,8 +35,10 @@ enum class MetalFamilyMac {
+@@ -35,8 +35,10 @@
  };
  
  MetalFamilyMac GetMetalFamilyMac(id<MTLDevice> device) {
@@ -24,5 +24,3 @@ index 9a98c42..9a98c42 100644
    }
    return MetalFamilyMac::kMac1;
  }
--- 
-2.50.0
