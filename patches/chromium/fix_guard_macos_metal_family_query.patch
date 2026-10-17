@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Electron <electron@github.com>
+From: thororen <78185467+thororen1234@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 00:00:00 -0400
 Subject: fix: guard Metal GPU-family query on older macOS
 
