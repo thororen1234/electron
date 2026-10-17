@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 08:24:00 -0400
+Subject: fix: only emit the clock sync signpost on macOS 10.14 and later
+
+os_signpost is only available from macOS 10.14, so check for it at
+runtime instead of failing to build for older deployment targets.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/src/tracing/internal/track_event_internal.cc b/src/tracing/internal/track_event_internal.cc
+index 53438231677accd736a6fd9cdb0410fee3c4faef..3299e8d10aa6b00426bdcd606b6769b1ff4182f1 100644
+--- a/src/tracing/internal/track_event_internal.cc
++++ b/src/tracing/internal/track_event_internal.cc
+@@ -465,11 +465,14 @@ void TrackEventInternal::ResetIncrementalState(
+     // with boot time.
+     // TODO(leszeks): Consider allowing synchronization against other clocks
+     // than boot time.
+-    static os_log_t log_handle = os_log_create(
+-        "dev.perfetto.clock_sync", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+-    os_signpost_event_emit(
+-        log_handle, OS_SIGNPOST_ID_EXCLUSIVE, "boottime", "%" PRId64,
+-        static_cast<uint64_t>(perfetto::base::GetBootTimeNs().count()));
++    // Signposts are only available from macOS 10.14.
++    if (__builtin_available(macOS 10.14, iOS 12.0, *)) {
++      static os_log_t log_handle = os_log_create(
++          "dev.perfetto.clock_sync", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
++      os_signpost_event_emit(
++          log_handle, OS_SIGNPOST_ID_EXCLUSIVE, "boottime", "%" PRId64,
++          static_cast<uint64_t>(perfetto::base::GetBootTimeNs().count()));
++    }
+ #endif
+ 
+     if (tls_state.default_clock != static_cast<uint32_t>(GetClockId())) {
