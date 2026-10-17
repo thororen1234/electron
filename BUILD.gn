@@ -54,8 +54,9 @@ if (is_mac) {
     assert(mac_deployment_target == "11.0",
            "Apple Silicon requires a macOS 11.0 deployment target")
   } else {
-    assert(mac_deployment_target == "10.13",
-           "Intel builds require a 10.13 deployment target for legacy macOS support")
+    assert(
+        mac_deployment_target == "10.13",
+        "Intel builds require a 10.13 deployment target for legacy macOS support")
   }
 }
 

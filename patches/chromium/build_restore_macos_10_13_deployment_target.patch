@@ -8,24 +8,32 @@ macOS target. This only changes the build and launch minimum; older runtime
 compatibility still depends on Chromium API availability.
 
 diff --git a/build/config/mac/mac_sdk.gni b/build/config/mac/mac_sdk.gni
-index d7c18c60fc7c1df9b2b17f585446ff62d42ee883..8866d0cacbb5b96ba6191e406389a5ec4532f42a 100644
+index d7c18c60fc7c1df9b2b17f585446ff62d42ee883..dc507e907fc36fd0fdc31c7ae5246ea3e17a953f 100644
 --- a/build/config/mac/mac_sdk.gni
 +++ b/build/config/mac/mac_sdk.gni
-@@ -26,7 +26,7 @@ declare_args() {
+@@ -26,7 +26,11 @@ declare_args() {
    # in availability and deprecation, which is why it is often changed
    # separately from `mac_min_system_version` when dropping support for older
    # macOSes.
 -  mac_deployment_target = "13.0"
-+  mac_deployment_target = target_cpu == "arm64" ? "11.0" : "10.13"
++  if (target_cpu == "arm64") {
++    mac_deployment_target = "11.0"
++  } else {
++    mac_deployment_target = "10.13"
++  }
  
    # The value of the `LSMinimumSystemVersion` in `Info.plist` files. This value
    # controls the minimum OS version that may launch the application, and OS
-@@ -35,7 +35,7 @@ declare_args() {
+@@ -35,7 +39,11 @@ declare_args() {
    # `mac_deployment_target` to increase the system requirement without changing
    # how Chromium is compiled. This must be greater than or equal to the
    # `mac_deployment_target` version.
 -  mac_min_system_version = "13.0"
-+  mac_min_system_version = target_cpu == "arm64" ? "11.0" : "10.13"
++  if (target_cpu == "arm64") {
++    mac_min_system_version = "11.0"
++  } else {
++    mac_min_system_version = "10.13"
++  }
  
    # Path to a specific version of the Mac SDK, not including a slash at the end.
    # If empty, the path to the lowest version greater than or equal to
