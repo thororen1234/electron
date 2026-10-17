@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:30:50 -0400
+Subject: fix: restore Windows 7 support for windows without DWM composition
+
+DWM composition is always on from Windows 8, but on Windows 7 it is off
+with the Basic and Classic themes, and can change at runtime. Without it,
+painting the nonclient area black before the default handler leaves black
+frame areas behind, for example while a window is moved.
+
+Restore Chromium's composition checks from before it dropped Windows 7:
+clear the nonclient area, extend the DWM frame and allow translucent or
+thick-framed popups only with composition, hide windows while toggling
+fullscreen without it, and handle WM_DWMCOMPOSITIONCHANGED. The redraw
+lock is left alone, since Electron always uses the native frame.
+
+This patch is needed for Windows 7 support and is not suitable for
+upstreaming.
+
+diff --git a/ui/base/win/shell.cc b/ui/base/win/shell.cc
+index ac53b1bed6e8c58832ae5a4c9a96b0b1e745f46b..7cf1416dc7a0b8d751f42e82fa97cc9345c19643 100644
+--- a/ui/base/win/shell.cc
++++ b/ui/base/win/shell.cc
+@@ -26,6 +26,7 @@
+ #include "base/win/scoped_co_mem.h"
+ #include "base/win/shell_util.h"
+ #include "base/win/win_util.h"
++#include "base/win/windows_version.h"
+ #include "ui/base/ui_base_switches.h"
+ 
+ namespace ui::win {
+@@ -265,4 +266,19 @@ void ClearWindowPropertyStore(HWND hwnd) {
+   DCHECK(FAILED(pps->GetCount(&property_count)) || property_count == 0);
+ }
+ 
++bool IsAeroGlassEnabled() {
++  // If composition is not enabled, we behave like on XP.
++  return IsDwmCompositionEnabled();
++}
++
++bool IsDwmCompositionEnabled() {
++  // As of Windows 8, DWM composition is always enabled.
++  // In Windows 7 this can change at runtime.
++  if (base::win::GetVersion() >= base::win::Version::WIN8) {
++    return true;
++  }
++  BOOL is_enabled;
++  return SUCCEEDED(DwmIsCompositionEnabled(&is_enabled)) && is_enabled;
++}
++
+ }  // namespace ui::win
+diff --git a/ui/base/win/shell.h b/ui/base/win/shell.h
+index 0de77a7410f144b1fbc8b55aebc3ce50cdfcdf3f..5d2b5112482b8c93560947a88a38b3c67a261a82 100644
+--- a/ui/base/win/shell.h
++++ b/ui/base/win/shell.h
+@@ -78,6 +78,14 @@ void SetRelaunchDetailsForWindow(const std::wstring& relaunch_command,
+ // Clears the Window Property Store on an HWND.
+ COMPONENT_EXPORT(UI_BASE) void ClearWindowPropertyStore(HWND hwnd);
+ 
++// Returns true if windows are drawn with Aero Glass, which requires DWM
++// composition.
++COMPONENT_EXPORT(UI_BASE) bool IsAeroGlassEnabled();
++
++// Returns true if DWM composition is turned on. It is always on from Windows 8,
++// but can be turned off and change at runtime on Windows 7.
++COMPONENT_EXPORT(UI_BASE) bool IsDwmCompositionEnabled();
++
+ }  // namespace ui::win
+ 
+ #endif  // UI_BASE_WIN_SHELL_H_
+diff --git a/ui/views/widget/widget_hwnd_utils.cc b/ui/views/widget/widget_hwnd_utils.cc
+index 56ed7cad8652cf57e597bb7f369e9e659ea6ed4d..8e5a72422c34461e468cb0d7c0c24fd75f60dfe0 100644
+--- a/ui/views/widget/widget_hwnd_utils.cc
++++ b/ui/views/widget/widget_hwnd_utils.cc
+@@ -12,6 +12,7 @@
+ #include "ui/base/mojom/window_show_state.mojom.h"
+ #include "ui/base/ui_base_features.h"
+ #include "ui/base/ui_base_switches.h"
++#include "ui/base/win/shell.h"
+ #include "ui/gfx/geometry/rounded_corners_f.h"
+ #include "ui/views/widget/widget_delegate.h"
+ #include "ui/views/win/hwnd_message_handler.h"
+@@ -120,7 +121,13 @@ WindowStyles CalculateWindowStylesFromInitParams(
+     case Widget::InitParams::TYPE_MENU:
+       styles.style |= WS_POPUP;
+       if (params.remove_standard_frame) {
+-        styles.style |= WS_THICKFRAME;
++        // If the platform doesn't support drop shadow, decorate the Window
++        // with just a border.
++        if (ui::win::IsAeroGlassEnabled()) {
++          styles.style |= WS_THICKFRAME;
++        } else {
++          styles.style |= WS_BORDER;
++        }
+       }
+       styles.ex_style |= WS_EX_TOOLWINDOW;
+       break;
+@@ -170,9 +177,11 @@ void ConfigureWindowStyles(
+   //    not have not have WM_SIZEBOX, WS_THICKFRAME or WS_CAPTION in its
+   //    style.
+   //
++  // This doesn't work when Aero is disabled, so disable it in that case.
+   // Software composited windows can continue to use WS_EX_LAYERED.
+   bool is_translucent =
+-      (params.opacity == Widget::InitParams::WindowOpacity::kTranslucent);
++      (params.opacity == Widget::InitParams::WindowOpacity::kTranslucent &&
++       (ui::win::IsAeroGlassEnabled() || params.force_software_compositing));
+ 
+   WindowStyles styles = CalculateWindowStylesFromInitParams(
+       params, widget_delegate, native_widget_delegate, is_translucent);
+diff --git a/ui/views/win/fullscreen_handler.cc b/ui/views/win/fullscreen_handler.cc
+index 4a26b269396e36a88c2c05e3b043b63ba7d8782e..49bdd7c553ab39334e61bae84107a32bcb6af3c3 100644
+--- a/ui/views/win/fullscreen_handler.cc
++++ b/ui/views/win/fullscreen_handler.cc
+@@ -7,6 +7,7 @@
+ #include <memory>
+ 
+ #include "base/win/win_util.h"
++#include "ui/base/win/shell.h"
+ #include "ui/display/types/display_constants.h"
+ #include "ui/display/win/screen_win.h"
+ #include "ui/display/win/screen_win_display.h"
+@@ -63,6 +64,13 @@ void FullscreenHandler::ProcessFullscreen(bool fullscreen,
+                                           int64_t target_display_id) {
+   std::unique_ptr<ScopedFullscreenVisibility> visibility;
+ 
++  // With Aero enabled disabling the visibility causes the window to disappear
++  // for several frames, which looks worse than doing other updates
++  // non-atomically.
++  if (!ui::win::IsAeroGlassEnabled()) {
++    visibility = std::make_unique<ScopedFullscreenVisibility>(hwnd_);
++  }
++
+   // Save current window state if not already fullscreen.
+   if (!fullscreen_) {
+     saved_window_info_.style = ::GetWindowLong(hwnd_, GWL_STYLE);
+diff --git a/ui/views/win/hwnd_message_handler.cc b/ui/views/win/hwnd_message_handler.cc
+index c958284e0fff644b8e8d2a55a7592207d3335bea..6bac592eadeb6f4076bc9680cf3120eabb7c02f5 100644
+--- a/ui/views/win/hwnd_message_handler.cc
++++ b/ui/views/win/hwnd_message_handler.cc
+@@ -55,6 +55,7 @@
+ #include "ui/base/win/lock_state.h"
+ #include "ui/base/win/mouse_wheel_util.h"
+ #include "ui/base/win/session_change_observer.h"
++#include "ui/base/win/shell.h"
+ #include "ui/base/win/touch_input.h"
+ #include "ui/base/win/win_cursor.h"
+ #include "ui/display/screen.h"
+@@ -233,6 +234,13 @@ void EnableMenuItemByCommand(HMENU menu, UINT command, bool enabled) {
+   EnableMenuItem(menu, command, flags);
+ }
+ 
++// Callback used to notify child windows that the top level window received a
++// DWMCompositionChanged message.
++BOOL CALLBACK SendDwmCompositionChanged(HWND window, LPARAM param) {
++  SendMessage(window, WM_DWMCOMPOSITIONCHANGED, 0, 0);
++  return TRUE;
++}
++
+ // The thickness of an auto-hide taskbar in pixels.
+ constexpr int kAutoHideTaskbarThicknessPx = 2;
+ 
+@@ -459,6 +467,7 @@ HWNDMessageHandler::HWNDMessageHandler(HWNDMessageHandlerDelegate* delegate,
+       touch_down_contexts_(0),
+       last_mouse_hwheel_time_(0),
+       dwm_transition_desired_(false),
++      dwm_composition_enabled_(ui::win::IsDwmCompositionEnabled()),
+       sent_window_size_changing_(false),
+       left_button_down_on_caption_(false),
+       background_fullscreen_hack_(false) {}
+@@ -706,7 +715,8 @@ std::vector<HWND> HWNDMessageHandler::GetOwnedWindows() {
+ }
+ 
+ void HWNDMessageHandler::SetDwmFrameExtension(DwmFrameState state) {
+-  if (!delegate_->HasFrame() && !is_translucent_) {
++  if (!delegate_->HasFrame() && ui::win::IsAeroGlassEnabled() &&
++      !is_translucent_) {
+     gfx::Insets insets;
+     if (state == DwmFrameState::kOn && !IsMaximized()) {
+       insets.set_top(1);
+@@ -2112,6 +2122,29 @@ void HWNDMessageHandler::OnDisplayChange(UINT bits_per_pixel,
+   SendFrameChanged();
+ }
+ 
++LRESULT HWNDMessageHandler::OnDwmCompositionChanged(UINT msg,
++                                                    WPARAM /* w_param */,
++                                                    LPARAM /* l_param */) {
++  TRACE_EVENT0("ui", "HWNDMessageHandler::OnDwmCompositionChanged");
++
++  if (!delegate_->HasNonClientView()) {
++    SetMsgHandled(FALSE);
++    return 0;
++  }
++
++  bool dwm_composition_enabled = ui::win::IsDwmCompositionEnabled();
++  if (dwm_composition_enabled_ != dwm_composition_enabled) {
++    // Do not cause the Window to be hidden and shown unless there was
++    // an actual change in the theme. This filter is necessary because
++    // Windows sends redundant WM_DWMCOMPOSITIONCHANGED messages when
++    // a laptop is reopened, and our theme change code causes wonky
++    // focus issues. See http://crbug.com/895855 for more information.
++    dwm_composition_enabled_ = dwm_composition_enabled;
++    FrameTypeChanged();
++  }
++  return 0;
++}
++
+ LRESULT HWNDMessageHandler::OnDpiChanged(UINT msg,
+                                          WPARAM w_param,
+                                          LPARAM l_param) {
+@@ -2183,7 +2216,8 @@ void HWNDMessageHandler::OnEnterSizeMove() {
+ 
+ LRESULT HWNDMessageHandler::OnEraseBkgnd(HDC dc) {
+   gfx::Insets insets;
+-  if (delegate_->GetDwmFrameInsetsInPixels(&insets) && !insets.IsEmpty() &&
++  if (ui::win::IsAeroGlassEnabled() &&
++      delegate_->GetDwmFrameInsetsInPixels(&insets) && !insets.IsEmpty() &&
+       needs_dwm_frame_clear_) {
+     // This is necessary to avoid white flashing in the titlebar area around the
+     // minimize/maximize/close buttons.
+@@ -2786,31 +2820,33 @@ void HWNDMessageHandler::OnNCPaint(HRGN rgn) {
+   // It's required to avoid some native painting artifacts from appearing when
+   // the window is resized.
+   if (!delegate_->HasNonClientView() || IsFrameSystemDrawn()) {
+-    // The default WM_NCPAINT handler under Aero Glass doesn't clear the
+-    // nonclient area, so it'll remain the default white color. That area is
+-    // invisible initially (covered by the window border) but can become
+-    // temporarily visible on maximizing or fullscreening, so clear it here.
+-    HDC dc = GetWindowDC(hwnd());
+-    RECT client_rect;
+-    ::GetClientRect(hwnd(), &client_rect);
+-    ::MapWindowPoints(hwnd(), nullptr, reinterpret_cast<POINT*>(&client_rect),
+-                      2);
+-    ::OffsetRect(&client_rect, static_cast<int>(-window_rect.left),
+-                 static_cast<int>(-window_rect.top));
+-    // client_rect now is in window space.
+-
+-    base::win::ScopedGDIObject<HRGN> base(
+-        ::CreateRectRgnIndirect(&dirty_region));
+-    base::win::ScopedGDIObject<HRGN> client(
+-        ::CreateRectRgnIndirect(&client_rect));
+-    base::win::ScopedGDIObject<HRGN> nonclient(::CreateRectRgn(0, 0, 0, 0));
+-    ::CombineRgn(nonclient.get(), base.get(), client.get(), RGN_DIFF);
+-
+-    ::SelectClipRgn(dc, nonclient.get());
+-    HBRUSH brush = CreateSolidBrush(0);
+-    ::FillRect(dc, &dirty_region, brush);
+-    ::DeleteObject(brush);
+-    ::ReleaseDC(hwnd(), dc);
++    if (ui::win::IsAeroGlassEnabled()) {
++      // The default WM_NCPAINT handler under Aero Glass doesn't clear the
++      // nonclient area, so it'll remain the default white color. That area is
++      // invisible initially (covered by the window border) but can become
++      // temporarily visible on maximizing or fullscreening, so clear it here.
++      HDC dc = GetWindowDC(hwnd());
++      RECT client_rect;
++      ::GetClientRect(hwnd(), &client_rect);
++      ::MapWindowPoints(hwnd(), nullptr,
++                        reinterpret_cast<POINT*>(&client_rect), 2);
++      ::OffsetRect(&client_rect, static_cast<int>(-window_rect.left),
++                   static_cast<int>(-window_rect.top));
++      // client_rect now is in window space.
++
++      base::win::ScopedGDIObject<HRGN> base(
++          ::CreateRectRgnIndirect(&dirty_region));
++      base::win::ScopedGDIObject<HRGN> client(
++          ::CreateRectRgnIndirect(&client_rect));
++      base::win::ScopedGDIObject<HRGN> nonclient(::CreateRectRgn(0, 0, 0, 0));
++      ::CombineRgn(nonclient.get(), base.get(), client.get(), RGN_DIFF);
++
++      ::SelectClipRgn(dc, nonclient.get());
++      HBRUSH brush = CreateSolidBrush(0);
++      ::FillRect(dc, &dirty_region, brush);
++      ::DeleteObject(brush);
++      ::ReleaseDC(hwnd(), dc);
++    }
+     SetMsgHandled(FALSE);
+     return;
+   }
+@@ -3886,13 +3922,18 @@ void HWNDMessageHandler::PerformDwmTransition() {
+   dwm_transition_desired_ = false;
+   delegate_->HandleFrameChanged();
+   SendFrameChanged();
++  // WM_DWMCOMPOSITIONCHANGED is only sent to top level windows, however we want
++  // to notify our children too, since we can have MDI child windows who need to
++  // update their appearance.
++  EnumChildWindows(hwnd(), &SendDwmCompositionChanged, NULL);
+ }
+ 
+ void HWNDMessageHandler::UpdateDwmFrame() {
+   TRACE_EVENT0("ui", "HWNDMessageHandler::UpdateDwmFrame");
+ 
+   gfx::Insets insets;
+-  if (delegate_->GetDwmFrameInsetsInPixels(&insets)) {
++  if (ui::win::IsAeroGlassEnabled() &&
++      delegate_->GetDwmFrameInsetsInPixels(&insets)) {
+     // Avoid redundant cross-process DWM calls when the margins haven't changed.
+     if (last_dwm_frame_insets_ == insets) {
+       return;
+diff --git a/ui/views/win/hwnd_message_handler.h b/ui/views/win/hwnd_message_handler.h
+index 9cb340b682ccf458f0e00d277d633dbe8ffc3e4c..a29a8183b20407196864a84417c101f03214b2df 100644
+--- a/ui/views/win/hwnd_message_handler.h
++++ b/ui/views/win/hwnd_message_handler.h
+@@ -435,6 +435,9 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+     CR_MESSAGE_HANDLER_EX(WM_NCUAHDRAWCAPTION, OnNCUAHDrawCaption)
+     CR_MESSAGE_HANDLER_EX(WM_NCUAHDRAWFRAME, OnNCUAHDrawFrame)
+ 
++    // Vista and newer
++    CR_MESSAGE_HANDLER_EX(WM_DWMCOMPOSITIONCHANGED, OnDwmCompositionChanged)
++
+     // Win 8.1 and newer
+     CR_MESSAGE_HANDLER_EX(WM_DPICHANGED, OnDpiChanged)
+ 
+@@ -544,6 +547,7 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+   void OnDestroy();
+   void OnDisplayChange(UINT bits_per_pixel, const gfx::Size& screen_size);
+   LRESULT OnDpiChanged(UINT msg, WPARAM w_param, LPARAM l_param);
++  LRESULT OnDwmCompositionChanged(UINT msg, WPARAM w_param, LPARAM l_param);
+   void OnEnterMenuLoop(BOOL from_track_popup_menu);
+   void OnEnterSizeMove();
+   LRESULT OnEraseBkgnd(HDC dc);
+@@ -816,6 +820,9 @@ class VIEWS_EXPORT HWNDMessageHandler : public gfx::WindowImpl,
+   // glass. Defaults to false.
+   bool dwm_transition_desired_;
+ 
++  // Is DWM composition currently enabled? Always true from Windows 8 on.
++  bool dwm_composition_enabled_;
++
+   // True if a size-changing WM_WINDOWPOSCHANGING has been observed but the
+   // corresponding client size change hasn't been processed yet.
+   bool sent_window_size_changing_;
