@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 08:54:47 -0400
+Subject: fix: use MACH_PORT_NULL for the default IOKit port
+
+kIOMainPortDefault only exists from macOS 12. Pass MACH_PORT_NULL, which
+it is defined as and which IOKit has always accepted for the default
+port.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/src/common/apple_platform_utils.mm b/src/common/apple_platform_utils.mm
+index 635abb6f2f9040e6efa8488beac7ebf0822a6906..e31d759cac7883f2d2cfb4def2bc705d3f7eff49 100644
+--- a/src/common/apple_platform_utils.mm
++++ b/src/common/apple_platform_utils.mm
+@@ -123,7 +123,7 @@ bool IsMetalRendererAvailable()
+ bool GetMacosMachineModel(std::string *outMachineModel)
+ {
+     io_service_t platformExpert = IOServiceGetMatchingService(
+-        kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
++        MACH_PORT_NULL, IOServiceMatching("IOPlatformExpertDevice"));
+ 
+     if (platformExpert == IO_OBJECT_NULL)
+     {
+diff --git a/src/gpu_info_util/SystemInfo_macos.mm b/src/gpu_info_util/SystemInfo_macos.mm
+index 40c5ec93ccd5d28824b2551b6266371a6a38a1da..39f799656bb2ce8e9fa56b19e06b9b3fb34c36dc 100644
+--- a/src/gpu_info_util/SystemInfo_macos.mm
++++ b/src/gpu_info_util/SystemInfo_macos.mm
+@@ -65,7 +65,7 @@ void GetIORegistryDevices(std::vector<GPUDeviceInfo> *devices)
+             ANGLE_UNSAFE_TODO(IOServiceMatching(kServiceNames[i]));
+ 
+         io_iterator_t entryIterator;
+-        if (IOServiceGetMatchingServices(kIOMainPortDefault, matchDictionary, &entryIterator) !=
++        if (IOServiceGetMatchingServices(MACH_PORT_NULL, matchDictionary, &entryIterator) !=
+             kIOReturnSuccess)
+         {
+             continue;
+@@ -160,7 +160,7 @@ void ForceGPUSwitchIndex(SystemInfo *info)
+         return;
+ 
+     CFMutableDictionaryRef matchDictionary = IORegistryEntryIDMatching(gpuID);
+-    io_service_t gpuEntry = IOServiceGetMatchingService(kIOMainPortDefault, matchDictionary);
++    io_service_t gpuEntry = IOServiceGetMatchingService(MACH_PORT_NULL, matchDictionary);
+ 
+     if (gpuEntry == IO_OBJECT_NULL)
+     {
+@@ -267,7 +267,7 @@ VendorID GetVendorIDFromMetalDeviceRegistryID(uint64_t registryID)
+     // IOServiceGetMatchingService will consume the reference on the matching dictionary,
+     // so we don't need to release the dictionary.
+     io_registry_entry_t acceleratorEntry =
+-        IOServiceGetMatchingService(kIOMainPortDefault, matchingDict);
++        IOServiceGetMatchingService(MACH_PORT_NULL, matchingDict);
+     if (acceleratorEntry == IO_OBJECT_NULL)
+     {
+         return 0;

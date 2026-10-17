@@ -12,9 +12,81 @@ targeting macOS versions older than 11, so check it with a static assert
 as is already done for iOS on x86, and widen it before multiplying by
 32-bit page counts so system memory info doesn't wrap above 4 GB.
 
+kIOMainPortDefault only exists from macOS 12. Pass MACH_PORT_NULL, which
+it is defined as and which IOKit has always accepted for the default
+port.
+
 This patch is needed for macOS 10.13 support and is not suitable for
 upstreaming.
 
+diff --git a/base/files/drive_info_mac.cc b/base/files/drive_info_mac.cc
+index 2c95cfbf92daa54f031991c9842f2341ae9c3b32..4860e5b19483e6ad475db8a034d921bc04d2cb6c 100644
+--- a/base/files/drive_info_mac.cc
++++ b/base/files/drive_info_mac.cc
+@@ -211,13 +211,13 @@ std::optional<DriveInfo> GetFileDriveInfo(const FilePath& file_path) {
+   }
+ 
+   apple::ScopedCFTypeRef<CFDictionaryRef> bsd_match_dict(
+-      IOBSDNameMatching(kIOMainPortDefault, /*options=*/0, dev_path.c_str()));
++      IOBSDNameMatching(MACH_PORT_NULL, /*options=*/0, dev_path.c_str()));
+   if (!bsd_match_dict) {
+     return std::nullopt;
+   }
+ 
+   mac::ScopedIOObject<io_object_t> io_media(IOServiceGetMatchingService(
+-      kIOMainPortDefault, bsd_match_dict.release()));
++      MACH_PORT_NULL, bsd_match_dict.release()));
+   if (!io_media) {
+     return std::nullopt;
+   }
+diff --git a/base/mac/mac_util.mm b/base/mac/mac_util.mm
+index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..736ebe0d2174a8f56e154e6a5af53473bda06c87 100644
+--- a/base/mac/mac_util.mm
++++ b/base/mac/mac_util.mm
+@@ -430,7 +430,7 @@ CPUType GetCPUType() {
+ 
+ std::string GetPlatformSerialNumber() {
+   base::mac::ScopedIOObject<io_service_t> expert_device(
+-      IOServiceGetMatchingService(kIOMainPortDefault,
++      IOServiceGetMatchingService(MACH_PORT_NULL,
+                                   IOServiceMatching("IOPlatformExpertDevice")));
+   if (!expert_device) {
+     DLOG(ERROR) << "Error retrieving the machine serial number.";
+diff --git a/base/power_monitor/battery_level_provider_mac.mm b/base/power_monitor/battery_level_provider_mac.mm
+index e4cbd05baeccab8107058042bf41b74425b36dbe..9939b4a5f0ab2fc69a8fa0a42091b1de13210412 100644
+--- a/base/power_monitor/battery_level_provider_mac.mm
++++ b/base/power_monitor/battery_level_provider_mac.mm
+@@ -65,7 +65,7 @@ void GetBatteryState(
+ std::optional<BatteryLevelProviderMac::BatteryState>
+ BatteryLevelProviderMac::GetBatteryStateImpl() {
+   const base::mac::ScopedIOObject<io_service_t> service(
+-      IOServiceGetMatchingService(kIOMainPortDefault,
++      IOServiceGetMatchingService(MACH_PORT_NULL,
+                                   IOServiceMatching("IOPMPowerSource")));
+   if (!service) {
+     // Macs without a battery don't necessarily provide the IOPMPowerSource
+diff --git a/base/power_monitor/iopm_power_source_sampling_event_source.cc b/base/power_monitor/iopm_power_source_sampling_event_source.cc
+index fe865bd0500a1ae4f894ee3bc105ac2dbc80543f..3d7d226aa20a0a01b9578c6b809f28fdc5a4b2ed 100644
+--- a/base/power_monitor/iopm_power_source_sampling_event_source.cc
++++ b/base/power_monitor/iopm_power_source_sampling_event_source.cc
+@@ -26,7 +26,7 @@ bool IOPMPowerSourceSamplingEventSource::Start(SamplingEventCallback callback) {
+   callback_ = callback;
+ 
+   service_.reset(IOServiceGetMatchingService(
+-      kIOMainPortDefault, IOServiceMatching("IOPMPowerSource")));
++      MACH_PORT_NULL, IOServiceMatching("IOPMPowerSource")));
+ 
+   if (!service_) {
+     VLOG(1) << "IOPMPowerSource service not found. This is expected on desktop "
+@@ -34,7 +34,7 @@ bool IOPMPowerSourceSamplingEventSource::Start(SamplingEventCallback callback) {
+     return false;
+   }
+ 
+-  notify_port_.reset(IONotificationPortCreate(kIOMainPortDefault));
++  notify_port_.reset(IONotificationPortCreate(MACH_PORT_NULL));
+   if (!notify_port_.is_valid()) {
+     LOG(ERROR) << "Could not create a notification port";
+     return false;
 diff --git a/base/process/process_metrics_apple.mm b/base/process/process_metrics_apple.mm
 index 2ffa8eb31094af7b7f9353126e07140e82f7dc5e..8beb58cd5114a46175869d6a0c686c520edad96c 100644
 --- a/base/process/process_metrics_apple.mm
@@ -76,3 +148,190 @@ index 2ffa8eb31094af7b7f9353126e07140e82f7dc5e..8beb58cd5114a46175869d6a0c686c52
  
    return true;
  }
+diff --git a/chrome/browser/extensions/api/image_writer_private/removable_storage_provider_mac.cc b/chrome/browser/extensions/api/image_writer_private/removable_storage_provider_mac.cc
+index 8e302f1a1641ff8df50dd5f079b267f98f943c84..72a9b9f5069e331bfd02191ed4be15056878e9fd 100644
+--- a/chrome/browser/extensions/api/image_writer_private/removable_storage_provider_mac.cc
++++ b/chrome/browser/extensions/api/image_writer_private/removable_storage_provider_mac.cc
+@@ -36,7 +36,7 @@ RemovableStorageProvider::PopulateDeviceList() {
+   // IOServiceGetMatchingServices consumes a reference to the matching
+   // dictionary passed to it.
+   base::mac::ScopedIOObject<io_service_t> disk_iterator;
+-  if (IOServiceGetMatchingServices(kIOMainPortDefault, matching.release(),
++  if (IOServiceGetMatchingServices(MACH_PORT_NULL, matching.release(),
+                                    disk_iterator.InitializeInto()) !=
+       KERN_SUCCESS) {
+     LOG(ERROR) << "Unable to get disk services.";
+diff --git a/chrome/browser/mac/install_from_dmg.mm b/chrome/browser/mac/install_from_dmg.mm
+index b822ec667f7a05b75312e275c7d3af0acf75d6c3..8d65db04c3c83cfc1fb3c0c53f53a1bbeed78c93 100644
+--- a/chrome/browser/mac/install_from_dmg.mm
++++ b/chrome/browser/mac/install_from_dmg.mm
+@@ -194,7 +194,7 @@ RunningFromDiskImageResult IsPathOnReadOnlyDiskImage(const char path[]) {
+   dmg_bsd_device_name = dmg_bsd_device_name.substr(dev_root.size());
+ 
+   base::apple::ScopedCFTypeRef<CFMutableDictionaryRef> match_dict(
+-      IOBSDNameMatching(kIOMainPortDefault, /*options=*/0,
++      IOBSDNameMatching(MACH_PORT_NULL, /*options=*/0,
+                         dmg_bsd_device_name.c_str()));
+   if (!match_dict) {
+     LOG(ERROR) << "IOBSDNameMatching " << dmg_bsd_device_name;
+@@ -203,7 +203,7 @@ RunningFromDiskImageResult IsPathOnReadOnlyDiskImage(const char path[]) {
+ 
+   base::mac::ScopedIOObject<io_iterator_t> iterator;
+   kern_return_t kr = IOServiceGetMatchingServices(
+-      kIOMainPortDefault, match_dict.release(), iterator.InitializeInto());
++      MACH_PORT_NULL, match_dict.release(), iterator.InitializeInto());
+   if (kr != KERN_SUCCESS) {
+     MACH_LOG(ERROR, kr) << "IOServiceGetMatchingServices";
+     return {.status = DiskImageStatus::kFailure};
+diff --git a/chrome/utility/image_writer/image_writer_mac.cc b/chrome/utility/image_writer/image_writer_mac.cc
+index 7a8dbd06b5b7eab1bb86bace831f5026b9566c55..a12e3de47ac0977f8d288b584aff662104c76bcd 100644
+--- a/chrome/utility/image_writer/image_writer_mac.cc
++++ b/chrome/utility/image_writer/image_writer_mac.cc
+@@ -47,7 +47,7 @@ bool ImageWriter::IsValidDevice() {
+   // IOServiceGetMatchingService consumes a reference to the matching dictionary
+   // passed to it.
+   base::mac::ScopedIOObject<io_service_t> disk_obj(
+-      IOServiceGetMatchingService(kIOMainPortDefault, matching.release()));
++      IOServiceGetMatchingService(MACH_PORT_NULL, matching.release()));
+   if (!disk_obj)
+     return false;
+ 
+diff --git a/components/power_metrics/energy_impact_mac.mm b/components/power_metrics/energy_impact_mac.mm
+index f6363793ff5b2f3f077244cb17fc635faf49b183..8dc680794ea889f19c6035c0d4380ff5cdee4af9 100644
+--- a/components/power_metrics/energy_impact_mac.mm
++++ b/components/power_metrics/energy_impact_mac.mm
+@@ -180,7 +180,7 @@
+ 
+ std::optional<std::string> GetBoardIdForThisMachine() {
+   base::mac::ScopedIOObject<io_service_t> platform_expert(
+-      IOServiceGetMatchingService(kIOMainPortDefault,
++      IOServiceGetMatchingService(MACH_PORT_NULL,
+                                   IOServiceMatching("IOPlatformExpertDevice")));
+   if (!platform_expert)
+     return std::nullopt;
+diff --git a/components/power_metrics/smc_mac.mm b/components/power_metrics/smc_mac.mm
+index fc1d9f93992c6328b00a4e6832fdb909919f79e7..398b317ced202b4b2c37b887b8d8d57fab15648a 100644
+--- a/components/power_metrics/smc_mac.mm
++++ b/components/power_metrics/smc_mac.mm
+@@ -22,7 +22,7 @@
+ // static
+ std::unique_ptr<SMCReader> SMCReader::Create() {
+   const base::mac::ScopedIOObject<io_service_t> smc_service(
+-      IOServiceGetMatchingService(kIOMainPortDefault,
++      IOServiceGetMatchingService(MACH_PORT_NULL,
+                                   IOServiceMatching("AppleSMC")));
+   base::mac::ScopedIOObject<io_object_t> connect;
+   if (IOServiceOpen(smc_service.get(), mach_task_self(), 1,
+diff --git a/device/bluetooth/bluetooth_adapter_mac.mm b/device/bluetooth/bluetooth_adapter_mac.mm
+index e686813116bc5351da4b23bce043c8c78e1f87d5..37d58a8cfc964293576f6a8e3e24eb12f2580e2f 100644
+--- a/device/bluetooth/bluetooth_adapter_mac.mm
++++ b/device/bluetooth/bluetooth_adapter_mac.mm
+@@ -300,7 +300,7 @@ bool IsDeviceSystemPaired(const std::string& device_address) {
+ 
+   base::mac::ScopedIOObject<io_iterator_t> iterator;
+   IOReturn result = IOServiceGetMatchingServices(
+-      kIOMainPortDefault, IOServiceMatching("IOBluetoothHCIController"),
++      MACH_PORT_NULL, IOServiceMatching("IOBluetoothHCIController"),
+       iterator.InitializeInto());
+   if (result != kIOReturnSuccess) {
+     BLUETOOTH_LOG(ERROR) << "Failed to enumerate Bluetooth controller: "
+diff --git a/device/gamepad/xbox_data_fetcher_mac.cc b/device/gamepad/xbox_data_fetcher_mac.cc
+index b194fc23e1baacd7e9cbae5eb5b785b45c7803ca..0643c742527fe3af323e0d58000fbcb7de88427e 100644
+--- a/device/gamepad/xbox_data_fetcher_mac.cc
++++ b/device/gamepad/xbox_data_fetcher_mac.cc
+@@ -192,7 +192,7 @@ bool XboxDataFetcher::RegisterForNotifications() {
+   if (listening_)
+     return true;
+   if (port_ == nullptr)
+-    port_.reset(IONotificationPortCreate(kIOMainPortDefault));
++    port_.reset(IONotificationPortCreate(MACH_PORT_NULL));
+   if (!port_.is_valid())
+     return false;
+   source_ = IONotificationPortGetRunLoopSource(port_.get());
+diff --git a/media/capture/video/mac/uvc_control_mac.mm b/media/capture/video/mac/uvc_control_mac.mm
+index 5288759851246eafd815f843da82506f04db2821..43c2915622665040832cb2d2c3c4850c5bf58925 100644
+--- a/media/capture/video/mac/uvc_control_mac.mm
++++ b/media/capture/video/mac/uvc_control_mac.mm
+@@ -182,7 +182,7 @@ static bool FindDeviceWithVendorAndProductIds(int vendor_id,
+                        base::apple::NSToCFPtrCast(@(product_id)));
+ 
+   kern_return_t kr = IOServiceGetMatchingServices(
+-      kIOMainPortDefault, query_dictionary.release(), usb_iterator);
++      MACH_PORT_NULL, query_dictionary.release(), usb_iterator);
+   if (kr != kIOReturnSuccess) {
+     VLOG(1) << "No devices found with specified Vendor and Product ID.";
+     return false;
+diff --git a/rlz/mac/lib/machine_id_mac.cc b/rlz/mac/lib/machine_id_mac.cc
+index ab1e53b0bdb4a069fe85aa3198b8c3aeba553094..312f80a827a38d260206f7bfd9f05be95bf4c95d 100644
+--- a/rlz/mac/lib/machine_id_mac.cc
++++ b/rlz/mac/lib/machine_id_mac.cc
+@@ -46,7 +46,7 @@ bool FindEthernetInterfaces(io_iterator_t* matching_services) {
+                        primary_interface.get());
+ 
+   kern_return_t kern_result = IOServiceGetMatchingServices(
+-      kIOMainPortDefault, matching_dict.release(), matching_services);
++      MACH_PORT_NULL, matching_dict.release(), matching_services);
+ 
+   return kern_result == KERN_SUCCESS;
+ }
+diff --git a/services/device/hid/hid_service_mac.cc b/services/device/hid/hid_service_mac.cc
+index f3e840f2e8a8c3e45a91827abf266142cdb43440..db2a05ef958220dac0ee2cd3ce7dacc6c171e311 100644
+--- a/services/device/hid/hid_service_mac.cc
++++ b/services/device/hid/hid_service_mac.cc
+@@ -82,7 +82,7 @@ scoped_refptr<HidDeviceInfo> CreateDeviceInfo(
+ }  // namespace
+ 
+ HidServiceMac::HidServiceMac() : weak_factory_(this) {
+-  notify_port_.reset(IONotificationPortCreate(kIOMainPortDefault));
++  notify_port_.reset(IONotificationPortCreate(MACH_PORT_NULL));
+   CFRunLoopAddSource(CFRunLoopGetMain(),
+                      IONotificationPortGetRunLoopSource(notify_port_.get()),
+                      kCFRunLoopDefaultMode);
+@@ -159,7 +159,7 @@ HidServiceMac::OpenOnBlockingThread(scoped_refptr<HidDeviceInfo> device_info) {
+   // IOServiceGetMatchingService consumes a reference to the matching dictionary
+   // passed to it.
+   base::mac::ScopedIOObject<io_service_t> service(
+-      IOServiceGetMatchingService(kIOMainPortDefault, matching_dict.release()));
++      IOServiceGetMatchingService(MACH_PORT_NULL, matching_dict.release()));
+   if (!service.get()) {
+     HID_LOG(DEBUG) << "IOService not found for ID: " << platform_device_id;
+     return base::apple::ScopedCFTypeRef<IOHIDDeviceRef>();
+diff --git a/services/device/serial/serial_device_enumerator_mac.cc b/services/device/serial/serial_device_enumerator_mac.cc
+index 565065dd26b66cd56a66795cf64d73990a3f5730..80ae8589667b310e87495362c345a8b5b0000bfc 100644
+--- a/services/device/serial/serial_device_enumerator_mac.cc
++++ b/services/device/serial/serial_device_enumerator_mac.cc
+@@ -126,7 +126,7 @@ std::optional<std::string> GetUsbDriverName(
+ }  // namespace
+ 
+ SerialDeviceEnumeratorMac::SerialDeviceEnumeratorMac() {
+-  notify_port_.reset(IONotificationPortCreate(kIOMainPortDefault));
++  notify_port_.reset(IONotificationPortCreate(MACH_PORT_NULL));
+   CFRunLoopAddSource(CFRunLoopGetMain(),
+                      IONotificationPortGetRunLoopSource(notify_port_.get()),
+                      kCFRunLoopDefaultMode);
+diff --git a/services/preferences/tracked/device_id_mac.cc b/services/preferences/tracked/device_id_mac.cc
+index bd2e65095a8de796e892c820d60298a8e4d13c71..33dd7c71ab5496b528c46cdaba5946793863837f 100644
+--- a/services/preferences/tracked/device_id_mac.cc
++++ b/services/preferences/tracked/device_id_mac.cc
+@@ -13,7 +13,7 @@
+ 
+ MachineIdStatus GetDeterministicMachineSpecificId(std::string* machine_id) {
+   base::mac::ScopedIOObject<io_service_t> platform_expert(
+-      IOServiceGetMatchingService(kIOMainPortDefault,
++      IOServiceGetMatchingService(MACH_PORT_NULL,
+                                   IOServiceMatching("IOPlatformExpertDevice")));
+   if (!platform_expert.get())
+     return MachineIdStatus::FAILURE;
+diff --git a/third_party/crashpad/crashpad/util/mac/mac_util.cc b/third_party/crashpad/crashpad/util/mac/mac_util.cc
+index 90666bb9cc31c719d25ce2bbc1e86752e08b3021..f76a5930212e17784261ebdd3510ded601f06ab4 100644
+--- a/third_party/crashpad/crashpad/util/mac/mac_util.cc
++++ b/third_party/crashpad/crashpad/util/mac/mac_util.cc
+@@ -248,7 +248,7 @@ bool MacOSVersionComponents(int* major,
+ 
+ void MacModelAndBoard(std::string* model, std::string* board_id) {
+   base::mac::ScopedIOObject<io_service_t> platform_expert(
+-      IOServiceGetMatchingService(kIOMainPortDefault,
++      IOServiceGetMatchingService(MACH_PORT_NULL,
+                                   IOServiceMatching("IOPlatformExpertDevice")));
+   if (platform_expert) {
+     model->assign(IORegistryEntryDataPropertyAsString(platform_expert.get(),

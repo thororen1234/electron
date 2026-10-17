@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 08:54:47 -0400
+Subject: fix: use MACH_PORT_NULL for the default IOKit port
+
+kIOMainPortDefault only exists from macOS 12. Pass MACH_PORT_NULL, which
+it is defined as and which IOKit has always accepted for the default
+port.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/src/dawn/native/metal/PhysicalDeviceMTL.mm b/src/dawn/native/metal/PhysicalDeviceMTL.mm
+index 2d7e99505cdcb76ce49aca674e3f16075d57f9eb..48489a0f9b9cf1cf76c6da6edf2678eb18c93ad4 100644
+--- a/src/dawn/native/metal/PhysicalDeviceMTL.mm
++++ b/src/dawn/native/metal/PhysicalDeviceMTL.mm
+@@ -138,7 +138,7 @@ MaybeError GetDeviceIORegistryPCIInfo(id<MTLDevice> device, PCIIDs* ids) {
+     // IOServiceGetMatchingService will consume the reference on the matching dictionary,
+     // so we don't need to release the dictionary.
+     IORef<io_registry_entry_t> acceleratorEntry =
+-        AcquireIORef(IOServiceGetMatchingService(kIOMainPortDefault, matchingDict.Detach()));
++        AcquireIORef(IOServiceGetMatchingService(MACH_PORT_NULL, matchingDict.Detach()));
+ 
+     if (acceleratorEntry == IO_OBJECT_NULL) {
+         return DAWN_INTERNAL_ERROR("Failed to get the IO registry entry for the accelerator");
