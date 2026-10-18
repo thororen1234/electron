@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:19:23 -0400
+Subject: build: support a macOS 10.13 deployment target in ANGLE
+
+ANGLE only builds for Chromium's minimum macOS version. Fix the code
+that fails to build when targeting macOS 10.13.
+
+GPU families can't be queried before macOS 10.15, so report the Metal
+renderer as unavailable there and use the OpenGL backend instead.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/src/common/apple_platform_utils.mm b/src/common/apple_platform_utils.mm
+index e31d759cac7883f2d2cfb4def2bc705d3f7eff49..ee12f4ac877d71f28ce7071d569280b33de99063 100644
+--- a/src/common/apple_platform_utils.mm
++++ b/src/common/apple_platform_utils.mm
+@@ -108,7 +108,12 @@ bool IsMetalRendererAvailable()
+             return [device supportsFamily:MTLGPUFamilyMacCatalyst2];
+ #elif TARGET_OS_MACCATALYST || TARGET_OS_OSX
+             // Devices in family 1, such as MacBookPro11,4, cannot use ANGLE's Metal backend.
+-            return [device supportsFamily:MTLGPUFamilyMac2];
++            // GPU families can't be queried before macOS 10.15, so use the OpenGL backend there.
++            if (@available(macOS 10.15, *))
++            {
++                return [device supportsFamily:MTLGPUFamilyMac2];
++            }
++            return false;
+ #else
+             // Devices starting with A9 onwards are supported. Simulator is supported as per
+             // definition that running simulator on Mac Family 1 devices is not supported.

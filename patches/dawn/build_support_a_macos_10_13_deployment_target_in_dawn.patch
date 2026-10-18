@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:19:24 -0400
+Subject: build: support a macOS 10.13 deployment target in Dawn
+
+Dawn only builds for Chromium's minimum macOS version. Fix the code that
+fails to build when targeting macOS 10.13.
+
+aligned_alloc() only exists from macOS 10.15, so use posix_memalign()
+on macOS.
+
+The Metal backend uses APIs from macOS 10.14 through 11 without checking
+their availability. Rather than guard every use, only offer Metal
+adapters on macOS 11 and later and build the backend without the
+unguarded availability warning. The newer symbols are still weak-linked,
+so Dawn loads on older releases and reports no Metal adapter there.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/src/dawn/common/AlignedAlloc.cpp b/src/dawn/common/AlignedAlloc.cpp
+index 7bbadce39144875620508fc513bd05da450fb9e3..ca72b9fd9cae64af94cd12f1b5b37501f15b0750 100644
+--- a/src/dawn/common/AlignedAlloc.cpp
++++ b/src/dawn/common/AlignedAlloc.cpp
+@@ -27,6 +27,7 @@
+ 
+ #include "src/dawn/common/AlignedAlloc.h"
+ 
++#include <algorithm>
+ #include <cstdlib>
+ 
+ #include "src/dawn/common/Math.h"
+@@ -49,6 +50,14 @@ void* AlignedAlloc(size_t size, size_t alignment) {
+     // instead.
+     return memalign(alignment, size);
+ 
++#elif DAWN_PLATFORM_IS(MACOS)
++    // aligned_alloc() is only available on macOS 10.15 and later.
++    void* ptr = nullptr;
++    if (posix_memalign(&ptr, std::max(alignment, sizeof(void*)), size) != 0) {
++        return nullptr;
++    }
++    return ptr;
++
+ #else
+     return aligned_alloc(alignment, size);
+ 
+diff --git a/src/dawn/native/BUILD.gn b/src/dawn/native/BUILD.gn
+index e72947b30c0bc8c0d4db5e2fe42cc1c6de9b7dca..4c48f281e76f4b8d4457e6e8d6e214ace7a0c6dc 100644
+--- a/src/dawn/native/BUILD.gn
++++ b/src/dawn/native/BUILD.gn
+@@ -764,6 +764,14 @@ source_set("sources") {
+         []) {
+       configs -= [ "//build/config/compiler:enable_arc" ]
+     }
++
++    # The Metal backend uses APIs newer than the macOS deployment target
++    # without availability checks. Backend::DiscoverPhysicalDevices() only
++    # offers it on macOS 11 and later, so those calls never run on older
++    # releases. Newer symbols are still weak-linked by availability.
++    if (is_mac) {
++      cflags_objcc = [ "-Wno-unguarded-availability-new" ]
++    }
+   }
+ 
+   if (dawn_enable_null) {
+@@ -1103,6 +1111,11 @@ dawn_component("native") {
+   }
+   if (dawn_enable_metal) {
+     sources += [ "metal/MetalBackend.mm" ]
++
++    # See the comment in the Metal section of "sources" above.
++    if (is_mac) {
++      cflags_objcc = [ "-Wno-unguarded-availability-new" ]
++    }
+   }
+   if (dawn_enable_null) {
+     sources += [ "null/NullBackend.cpp" ]
+diff --git a/src/dawn/native/metal/BackendMTL.mm b/src/dawn/native/metal/BackendMTL.mm
+index b15f0a25bf502b135009bf1fdad5c71666976319..ebaa6593c4fe629af4f515b7e3bee815228754d5 100644
+--- a/src/dawn/native/metal/BackendMTL.mm
++++ b/src/dawn/native/metal/BackendMTL.mm
+@@ -84,6 +84,16 @@ bool CheckMetalValidationEnabled(InstanceBase* instance) {
+         return std::vector<Ref<PhysicalDeviceBase>>{mPhysicalDevices};
+     }
+ 
++#if DAWN_PLATFORM_IS(MACOS)
++    // The Metal backend uses APIs from macOS 11 without availability checks, so it is only
++    // offered on macOS 11 and later.
++    if (@available(macOS 11.0, *)) {
++        // This empty block is intentional, @available must be in a plain 'if' statement.
++    } else {
++        return {};
++    }
++#endif
++
+     bool metalValidationEnabled = CheckMetalValidationEnabled(GetInstance());
+ #if DAWN_PLATFORM_IS(MACOS)
+     NSRef<NSArray<id<MTLDevice>>> devices = AcquireNSRef(MTLCopyAllDevices());

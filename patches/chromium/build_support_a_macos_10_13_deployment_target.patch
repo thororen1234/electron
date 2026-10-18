@@ -16,6 +16,15 @@ kIOMainPortDefault only exists from macOS 12. Pass MACH_PORT_NULL, which
 it is defined as and which IOKit has always accepted for the default
 port.
 
+Before macOS 10.15, launch applications with the NSWorkspace launch
+options API that NSWorkspaceOpenConfiguration replaced, and set a child
+process's working directory with pthread_chdir_np() as on iOS instead of
+posix_spawn_file_actions_addchdir_np(). CPU security mitigations for
+child processes are only requested on macOS 11 and later, and stack
+frames are decoded by hand before pthread_stack_frame_decode_np() exists
+in macOS 10.14. The SVG pasteboard type uses its identifier string, as
+UTTypeSVG needs macOS 11.
+
 This patch is needed for macOS 10.13 support and is not suitable for
 upstreaming.
 
@@ -39,8 +48,122 @@ index 2c95cfbf92daa54f031991c9842f2341ae9c3b32..4860e5b19483e6ad475db8a034d921bc
    if (!io_media) {
      return std::nullopt;
    }
+diff --git a/base/mac/launch_application.mm b/base/mac/launch_application.mm
+index 832ba7c14d0b62124bdbdca4122286403c9756a9..50c275e713e3ef37e95690b7c899e2101927e6ea 100644
+--- a/base/mac/launch_application.mm
++++ b/base/mac/launch_application.mm
+@@ -63,7 +63,7 @@
+ 
+ NSWorkspaceOpenConfiguration* GetOpenConfiguration(
+     LaunchApplicationOptions options,
+-    const CommandLineArgs& command_line_args) {
++    const CommandLineArgs& command_line_args) API_AVAILABLE(macos(10.15)) {
+   NSWorkspaceOpenConfiguration* config =
+       [NSWorkspaceOpenConfiguration configuration];
+ 
+@@ -84,6 +84,26 @@
+   return config;
+ }
+ 
++NSWorkspaceLaunchOptions GetLaunchOptions(LaunchApplicationOptions options) {
++  NSWorkspaceLaunchOptions launch_options = NSWorkspaceLaunchDefault;
++
++  if (!options.activate) {
++    launch_options |= NSWorkspaceLaunchWithoutActivation;
++  }
++  if (options.create_new_instance) {
++    launch_options |= NSWorkspaceLaunchNewInstance;
++  }
++  if (options.prompt_user_if_needed) {
++    launch_options |= NSWorkspaceLaunchWithErrorPresentation;
++  }
++  if (options.hidden_in_background) {
++    launch_options |= NSWorkspaceLaunchWithoutAddingToRecents |
++                      NSWorkspaceLaunchAndHide;
++  }
++
++  return launch_options;
++}
++
+ void LogResultAndInvokeCallback(const base::FilePath& app_bundle_path,
+                                 bool create_new_instance,
+                                 LaunchApplicationCallback callback,
+@@ -132,26 +152,58 @@ void LaunchApplication(const base::FilePath& app_bundle_path,
+     }
+   }
+ 
+-  void (^action_block)(NSRunningApplication*, NSError*) =
+-      ^void(NSRunningApplication* app, NSError* error) {
+-        dispatch_async(dispatch_get_main_queue(), ^{
+-          std::move(callback_block_access).Run(app, error);
+-        });
+-      };
++  if (@available(macOS 10.15, *)) {
++    void (^action_block)(NSRunningApplication*, NSError*) =
++        ^void(NSRunningApplication* app, NSError* error) {
++          dispatch_async(dispatch_get_main_queue(), ^{
++            std::move(callback_block_access).Run(app, error);
++          });
++        };
++
++    NSWorkspaceOpenConfiguration* configuration =
++        GetOpenConfiguration(options, command_line_args);
++
++    if (ns_urls) {
++      [NSWorkspace.sharedWorkspace openURLs:ns_urls
++                       withApplicationAtURL:bundle_url
++                              configuration:configuration
++                          completionHandler:action_block];
++    } else {
++      [NSWorkspace.sharedWorkspace openApplicationAtURL:bundle_url
++                                          configuration:configuration
++                                      completionHandler:action_block];
++    }
++    return;
++  }
++
++  NSDictionary* configuration = @{
++    NSWorkspaceLaunchConfigurationArguments :
++        CommandLineArgsToArgsArray(command_line_args),
++  };
+ 
+-  NSWorkspaceOpenConfiguration* configuration =
+-      GetOpenConfiguration(options, command_line_args);
++  NSWorkspaceLaunchOptions launch_options = GetLaunchOptions(options);
+ 
++  NSError* error = nil;
++  NSRunningApplication* app;
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+   if (ns_urls) {
+-    [NSWorkspace.sharedWorkspace openURLs:ns_urls
+-                     withApplicationAtURL:bundle_url
+-                            configuration:configuration
+-                        completionHandler:action_block];
++    app = [NSWorkspace.sharedWorkspace openURLs:ns_urls
++                           withApplicationAtURL:bundle_url
++                                        options:launch_options
++                                  configuration:configuration
++                                          error:&error];
+   } else {
+-    [NSWorkspace.sharedWorkspace openApplicationAtURL:bundle_url
+-                                        configuration:configuration
+-                                    completionHandler:action_block];
++    app = [NSWorkspace.sharedWorkspace launchApplicationAtURL:bundle_url
++                                                      options:launch_options
++                                                configuration:configuration
++                                                        error:&error];
+   }
++#pragma clang diagnostic pop
++
++  dispatch_async(dispatch_get_main_queue(), ^{
++    std::move(callback_block_access).Run(app, error);
++  });
+ }
+ 
+ }  // namespace base::mac
 diff --git a/base/mac/mac_util.mm b/base/mac/mac_util.mm
-index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..736ebe0d2174a8f56e154e6a5af53473bda06c87 100644
+index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..6295686627de12000e7dc81dfdee8ba94d3afb8d 100644
 --- a/base/mac/mac_util.mm
 +++ b/base/mac/mac_util.mm
 @@ -430,7 +430,7 @@ CPUType GetCPUType() {
@@ -52,6 +175,25 @@ index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..736ebe0d2174a8f56e154e6a5af53473
                                    IOServiceMatching("IOPlatformExpertDevice")));
    if (!expert_device) {
      DLOG(ERROR) << "Error retrieving the machine serial number.";
+@@ -547,10 +547,14 @@ void OpenSystemSettingsPane(SystemSettingsPane pane,
+       NOTREACHED();
+   }
+ 
+-  [NSWorkspace.sharedWorkspace
+-                openURL:[NSURL URLWithString:url]
+-          configuration:[NSWorkspaceOpenConfiguration configuration]
+-      completionHandler:nil];
++  if (@available(macOS 10.15, *)) {
++    [NSWorkspace.sharedWorkspace
++                  openURL:[NSURL URLWithString:url]
++            configuration:[NSWorkspaceOpenConfiguration configuration]
++        completionHandler:nil];
++  } else {
++    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:url]];
++  }
+ }
+ 
+ }  // namespace base::mac
 diff --git a/base/power_monitor/battery_level_provider_mac.mm b/base/power_monitor/battery_level_provider_mac.mm
 index e4cbd05baeccab8107058042bf41b74425b36dbe..9939b4a5f0ab2fc69a8fa0a42091b1de13210412 100644
 --- a/base/power_monitor/battery_level_provider_mac.mm
@@ -87,6 +229,92 @@ index fe865bd0500a1ae4f894ee3bc105ac2dbc80543f..3d7d226aa20a0a01b9578c6b809f28fd
    if (!notify_port_.is_valid()) {
      LOG(ERROR) << "Could not create a notification port";
      return false;
+diff --git a/base/process/launch_mac.cc b/base/process/launch_mac.cc
+index 2f86e619a4441c0d290834da431931216426bf3e..97c951a7691a698fe93e26d3987018747f699ab3 100644
+--- a/base/process/launch_mac.cc
++++ b/base/process/launch_mac.cc
+@@ -165,7 +165,7 @@ class PosixSpawnFileActions {
+   }
+ 
+ #if BUILDFLAG(IS_MAC)
+-  void Chdir(const char* path) {
++  void Chdir(const char* path) API_AVAILABLE(macos(10.15)) {
+     if (__builtin_available(macOS 26, *)) {
+       DPSXCHECK(posix_spawn_file_actions_addchdir(&file_actions_, path));
+     } else {
+@@ -180,7 +180,6 @@ class PosixSpawnFileActions {
+   posix_spawn_file_actions_t file_actions_;
+ };
+ 
+-#if !BUILDFLAG(IS_MAC)
+ int ChangeCurrentThreadDirectory(const char* path) {
+ #if IS_MAS_BUILD()
+   #pragma clang diagnostic push
+@@ -204,7 +203,6 @@ int ResetCurrentThreadDirectory() {
+   return pthread_fchdir_np(-1);
+ #endif
+ }
+-#endif
+ 
+ struct GetAppOutputOptions {
+   // Whether to pipe stderr to stdout in |output|.
+@@ -367,23 +365,31 @@ Process LaunchProcess(const std::vector<std::string>& argv,
+                                     : argv_cstr[0];
+ 
+   if (options.enable_cpu_security_mitigations) {
+-    DPSXCHECK(posix_spawnattr_set_csm_np(attr.get(), POSIX_SPAWN_NP_CSM_ALL));
++    if (__builtin_available(macOS 11, iOS 14, *)) {
++      DPSXCHECK(
++          posix_spawnattr_set_csm_np(attr.get(), POSIX_SPAWN_NP_CSM_ALL));
++    }
+   }
+ 
++  bool changed_thread_directory = false;
+   if (!options.current_directory.empty()) {
+     const char* chdir_str = options.current_directory.value().c_str();
+ #if BUILDFLAG(IS_MAC)
+-    file_actions.Chdir(chdir_str);
+-#else
+-    // If the chdir posix_spawn_file_actions extension is not available,
+-    // change the thread-specific working directory. The new process will
+-    // inherit it during posix_spawnp().
+-    int rv = ChangeCurrentThreadDirectory(chdir_str);
+-    if (rv != 0) {
+-      DPLOG(ERROR) << "pthread_chdir_np";
+-      return Process();
+-    }
++    if (__builtin_available(macOS 10.15, *)) {
++      file_actions.Chdir(chdir_str);
++    } else
+ #endif
++    {
++      // If the chdir posix_spawn_file_actions extension is not available,
++      // change the thread-specific working directory. The new process will
++      // inherit it during posix_spawnp().
++      int rv = ChangeCurrentThreadDirectory(chdir_str);
++      if (rv != 0) {
++        DPLOG(ERROR) << "pthread_chdir_np";
++        return Process();
++      }
++      changed_thread_directory = true;
++    }
+   }
+ 
+   int rv;
+@@ -453,12 +459,10 @@ Process LaunchProcess(const std::vector<std::string>& argv,
+ #endif
+   }
+ 
+-#if !BUILDFLAG(IS_MAC)
+   // Restore the thread's working directory if it was changed.
+-  if (!options.current_directory.empty()) {
++  if (changed_thread_directory) {
+     ResetCurrentThreadDirectory();
+   }
+-#endif
+ 
+   if (rv != 0) {
+     DLOG(ERROR) << "posix_spawnp(" << executable_path << "): -" << rv << " "
 diff --git a/base/process/process_metrics_apple.mm b/base/process/process_metrics_apple.mm
 index 2ffa8eb31094af7b7f9353126e07140e82f7dc5e..8beb58cd5114a46175869d6a0c686c520edad96c 100644
 --- a/base/process/process_metrics_apple.mm
@@ -148,6 +376,31 @@ index 2ffa8eb31094af7b7f9353126e07140e82f7dc5e..8beb58cd5114a46175869d6a0c686c52
  
    return true;
  }
+diff --git a/base/profiler/frame_pointer_unwinder.cc b/base/profiler/frame_pointer_unwinder.cc
+index 9634a7f651376863299e8f65611e2faa0b1e78da..b4e243e36d91f6d9790fe22b0eb31332d9ef6dee 100644
+--- a/base/profiler/frame_pointer_unwinder.cc
++++ b/base/profiler/frame_pointer_unwinder.cc
+@@ -26,8 +26,10 @@ namespace {
+ // `frame_pointer`.
+ uintptr_t DecodeFrame(uintptr_t frame_pointer, uintptr_t* return_address) {
+ #if BUILDFLAG(IS_APPLE)
+-  return pthread_stack_frame_decode_np(frame_pointer, return_address);
+-#else
++  if (__builtin_available(macOS 10.14, iOS 12, *)) {
++    return pthread_stack_frame_decode_np(frame_pointer, return_address);
++  }
++#endif
+   const uintptr_t* fp = reinterpret_cast<uintptr_t*>(frame_pointer);
+ 
+   // MSAN does not consider the frame pointers and return addresses to have
+@@ -38,7 +40,6 @@ uintptr_t DecodeFrame(uintptr_t frame_pointer, uintptr_t* return_address) {
+   uintptr_t next_frame = *fp;
+   *return_address = *(UNSAFE_TODO(fp + 1));
+   return next_frame;
+-#endif
+ }
+ 
+ }  // namespace
 diff --git a/chrome/browser/extensions/api/image_writer_private/removable_storage_provider_mac.cc b/chrome/browser/extensions/api/image_writer_private/removable_storage_provider_mac.cc
 index 8e302f1a1641ff8df50dd5f079b267f98f943c84..72a9b9f5069e331bfd02191ed4be15056878e9fd 100644
 --- a/chrome/browser/extensions/api/image_writer_private/removable_storage_provider_mac.cc
@@ -335,3 +588,17 @@ index 90666bb9cc31c719d25ce2bbc1e86752e08b3021..f76a5930212e17784261ebdd3510ded6
                                    IOServiceMatching("IOPlatformExpertDevice")));
    if (platform_expert) {
      model->assign(IORegistryEntryDataPropertyAsString(platform_expert.get(),
+diff --git a/ui/base/clipboard/clipboard_format_type_mac.mm b/ui/base/clipboard/clipboard_format_type_mac.mm
+index 5e1b88236fe983850bd28d0b6325af5c8d517d93..39623a57e53a4cf3630446c664fd69a3bcf9f2d4 100644
+--- a/ui/base/clipboard/clipboard_format_type_mac.mm
++++ b/ui/base/clipboard/clipboard_format_type_mac.mm
+@@ -125,7 +125,8 @@
+ }
+ 
+ const ClipboardFormatType& ClipboardFormatType::SvgType() {
+-  static base::NoDestructor<ClipboardFormatType> type(UTTypeSVG.identifier);
++  // UTTypeSVG requires macOS 11; this is its identifier.
++  static base::NoDestructor<ClipboardFormatType> type(@"public.svg-image");
+   return *type;
+ }
+ 
