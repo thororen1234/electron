@@ -25,6 +25,16 @@ frames are decoded by hand before pthread_stack_frame_decode_np() exists
 in macOS 10.14. The SVG pasteboard type uses its identifier string, as
 UTTypeSVG needs macOS 11.
 
+Unexportable keys live in the data protection keychain, so they are only
+offered on macOS 10.15 and later. Web MIDI only uses the MIDIEventList
+APIs on macOS 11 and later. Native colors fall back to the Aqua
+appearance before dark mode exists in macOS 10.14, and set the current
+appearance around color lookups before
+performAsCurrentDrawingAppearance: exists in macOS 11. Transfer functions
+and HDR color space names that newer releases added are only used where
+they exist. MTLSharedEventFence only holds events created by newer Metal
+APIs, so it doesn't need its own checks.
+
 This patch is needed for macOS 10.13 support and is not suitable for
 upstreaming.
 
@@ -475,6 +485,67 @@ index fc1d9f93992c6328b00a4e6832fdb909919f79e7..398b317ced202b4b2c37b887b8d8d57f
                                    IOServiceMatching("AppleSMC")));
    base::mac::ScopedIOObject<io_object_t> connect;
    if (IOServiceOpen(smc_service.get(), mach_task_self(), 1,
+diff --git a/crypto/apple/unexportable_key_apple.mm b/crypto/apple/unexportable_key_apple.mm
+index 365706f7b536c59f65be3272c79f428bdc5941c1..95d735f8477dff520baf925049b3de4320bf9038 100644
+--- a/crypto/apple/unexportable_key_apple.mm
++++ b/crypto/apple/unexportable_key_apple.mm
+@@ -181,7 +181,6 @@ void LogKeychainOperationError(
+ FindUnexportableKeys(FindUnexportableKeysOptions options) {
+   auto [access_group, application_tag_prefix, wrapped_key, lacontext] = options;
+   NSMutableDictionary* query = [NSMutableDictionary dictionaryWithDictionary:@{
+-    CFToNSPtrCast(kSecUseDataProtectionKeychain) : @YES,
+     CFToNSPtrCast(kSecClass) : CFToNSPtrCast(kSecClassKey),
+     CFToNSPtrCast(kSecAttrKeyType) :
+         CFToNSPtrCast(kSecAttrKeyTypeECSECPrimeRandom),
+@@ -190,6 +189,11 @@ void LogKeychainOperationError(
+     CFToNSPtrCast(kSecReturnAttributes) : @YES,
+     CFToNSPtrCast(kSecReturnRef) : @YES,
+   }];
++  // Keys are only used on macOS 10.15 and later, see
++  // GetUnexportableKeyProviderApple().
++  if (@available(macOS 10.15, iOS 13, *)) {
++    query[CFToNSPtrCast(kSecUseDataProtectionKeychain)] = @YES;
++  }
+ 
+   if (!wrapped_key.empty()) {
+     query[CFToNSPtrCast(kSecAttrApplicationLabel)] =
+@@ -452,8 +456,8 @@ explicit AppleKeyImpl(CFDictionaryRef key_attributes)
+     key_attributes[CFToNSPtrCast(kSecUseAuthenticationContext)] = lacontext;
+   }
+ 
+-  NSDictionary* attributes = @{
+-    CFToNSPtrCast(kSecUseDataProtectionKeychain) : @YES,
++  NSMutableDictionary* attributes =
++      [NSMutableDictionary dictionaryWithDictionary:@{
+     CFToNSPtrCast(kSecAttrKeyType) :
+         CFToNSPtrCast(kSecAttrKeyTypeECSECPrimeRandom),
+     CFToNSPtrCast(kSecAttrKeySizeInBits) : @256,
+@@ -463,7 +467,12 @@ explicit AppleKeyImpl(CFDictionaryRef key_attributes)
+     CFToNSPtrCast(kSecAttrAccessGroup) : keychain_access_group,
+     CFToNSPtrCast(kSecAttrLabel) : base::SysUTF8ToNSString(kAttrLabel),
+     CFToNSPtrCast(kSecAttrApplicationTag) : application_tag,
+-  };
++  }];
++  // Keys are only used on macOS 10.15 and later, see
++  // GetUnexportableKeyProviderApple().
++  if (@available(macOS 10.15, iOS 13, *)) {
++    attributes[CFToNSPtrCast(kSecUseDataProtectionKeychain)] = @YES;
++  }
+ 
+   base::apple::ScopedCFTypeRef<CFErrorRef> error;
+   base::apple::ScopedCFTypeRef<SecKeyRef> private_key(
+@@ -767,6 +776,11 @@ explicit AppleKeyImpl(CFDictionaryRef key_attributes)
+       << "A keychain access group must be set when using unexportable keys on "
+          "Apple platforms";
+ #if !BUILDFLAG(IS_IOS)
++  // Keys live in the data protection keychain, which needs macOS 10.15.
++  if (@available(macOS 10.15, *)) {
++  } else {
++    return nullptr;
++  }
+   // Secure Enclave on iOS is available since the iPhone 5s (A7 chip). This
+   // redundant check causes crashes because of the synchronous initialization of
+   // `TKTokenWatcher` on every call.
 diff --git a/device/bluetooth/bluetooth_adapter_mac.mm b/device/bluetooth/bluetooth_adapter_mac.mm
 index e686813116bc5351da4b23bce043c8c78e1f87d5..37d58a8cfc964293576f6a8e3e24eb12f2580e2f 100644
 --- a/device/bluetooth/bluetooth_adapter_mac.mm
@@ -514,6 +585,63 @@ index 5288759851246eafd815f843da82506f04db2821..43c2915622665040832cb2d2c3c4850c
    if (kr != kIOReturnSuccess) {
      VLOG(1) << "No devices found with specified Vendor and Product ID.";
      return false;
+diff --git a/media/midi/midi_manager_mac.cc b/media/midi/midi_manager_mac.cc
+index a44099cf1dd3fa365f2b9e5a6936df742bd0495b..36ddf45755b70b52c0a067fb586b1e1ed297c25c 100644
+--- a/media/midi/midi_manager_mac.cc
++++ b/media/midi/midi_manager_mac.cc
+@@ -130,6 +130,15 @@ MIDITimeStamp TimeTicksToMIDITimeStamp(base::TimeTicks ticks) {
+   return static_cast<uint64_t>(result);
+ }
+ 
++// The MIDIEventList (UMP) APIs need macOS 11. Callers suppress the
++// availability warning around the calls this function guards.
++bool UseUmp() {
++  if (__builtin_available(macOS 11.0, *)) {
++    return base::FeatureList::IsEnabled(features::kMidiMacUmp);
++  }
++  return false;
++}
++
+ }  // namespace
+ 
+ MidiManager* MidiManager::Create(MidiService* service) {
+@@ -187,13 +196,16 @@ void MidiManagerMac::InitializeCoreMIDI() {
+   // Create input and output port. These MIDIPortRef references are not needed
+   // to be disposed explicitly. CoreMIDI automatically disposes them on the
+   // client disposal.
+-  if (base::FeatureList::IsEnabled(features::kMidiMacUmp)) {
++  if (UseUmp()) {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+     result = MIDIInputPortCreateWithProtocol(
+         client, CFSTR("MIDI Input"), kMIDIProtocol_1_0, &midi_input_,
+         ^(const MIDIEventList* event_list, void* src_conn_refcon) {
+           this->ReceiveMidiEventList(
+               reinterpret_cast<uintptr_t>(src_conn_refcon), event_list);
+         });
++#pragma clang diagnostic pop
+   } else {
+     result = MIDIInputPortCreate(client, CFSTR("MIDI Input"), ReadMidiDispatch,
+                                  this, &midi_input_);
+@@ -376,7 +388,9 @@ void MidiManagerMac::SendMidiData(MidiManagerClient* client,
+   MIDITimeStamp coremidi_timestamp = TimeTicksToMIDITimeStamp(timestamp);
+   MIDIEndpointRef destination = destinations_[port_index];
+ 
+-  if (base::FeatureList::IsEnabled(features::kMidiMacUmp)) {
++  if (UseUmp()) {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+     // UMP (EventList) path
+     base::span<const uint8_t> data_span(data);
+     std::vector<uint32_t> ump_words;
+@@ -432,6 +446,7 @@ void MidiManagerMac::SendMidiData(MidiManagerClient* client,
+       MIDISendEventList(midi_output_, destination, event_list);
+       words_sent += words_to_send;
+     }
++#pragma clang diagnostic pop
+   } else {
+     // Legacy (PacketList) path
+     size_t send_size;
 diff --git a/rlz/mac/lib/machine_id_mac.cc b/rlz/mac/lib/machine_id_mac.cc
 index ab1e53b0bdb4a069fe85aa3198b8c3aeba553094..312f80a827a38d260206f7bfd9f05be95bf4c95d 100644
 --- a/rlz/mac/lib/machine_id_mac.cc
@@ -602,3 +730,176 @@ index 5e1b88236fe983850bd28d0b6325af5c8d517d93..39623a57e53a4cf3630446c664fd69a3
    return *type;
  }
  
+diff --git a/ui/color/mac/native_color_mixers_mac.mm b/ui/color/mac/native_color_mixers_mac.mm
+index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..eb36e4ddc8ec219d87f7f63fb5255c57fffbd203 100644
+--- a/ui/color/mac/native_color_mixers_mac.mm
++++ b/ui/color/mac/native_color_mixers_mac.mm
+@@ -55,6 +55,11 @@ AppearanceProperties AppearancePropertiesForKey(const ColorProviderKey& key) {
+   // appearanceNamed:]` and yet this code does so. This yields the same
+   // `NSAppearance` objects that result from passing the non-high contrast names
+   // to -`appearanceNamed:`.
++  if (@available(macOS 10.14, *)) {
++  } else {
++    // There is no dark or high contrast appearance before macOS 10.14.
++    return [NSAppearance appearanceNamed:NSAppearanceNameAqua];
++  }
+   if (properties.dark) {
+     return [NSAppearance
+         appearanceNamed:properties.high_contrast
+@@ -68,6 +73,23 @@ AppearanceProperties AppearancePropertiesForKey(const ColorProviderKey& key) {
+   }
+ }
+ 
++// -[NSAppearance performAsCurrentDrawingAppearance:] needs macOS 11. Before
++// that, set the current appearance around the block instead.
++void PerformAsCurrentDrawingAppearance(NSAppearance* appearance,
++                                       void (^block)(void)) {
++  if (@available(macOS 11.0, *)) {
++    [appearance performAsCurrentDrawingAppearance:block];
++    return;
++  }
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++  NSAppearance* saved_appearance = NSAppearance.currentAppearance;
++  NSAppearance.currentAppearance = appearance;
++  block();
++  NSAppearance.currentAppearance = saved_appearance;
++#pragma clang diagnostic pop
++}
++
+ SkColor NSSystemColorToSkColor(NSColor* color) {
+   // It is expected that the colors that will flow through this function will be
+   // catalog colors. Being a catalog color means that it doesn't have explicit
+@@ -111,7 +133,7 @@ void AddNativeCoreColorMixer(ColorProvider* provider,
+         NSSystemColorToSkColor(NSColor.keyboardFocusIndicatorColor), 0x66)};
+   };
+ 
+-  [AppearanceForKey(key) performAsCurrentDrawingAppearance:load_colors];
++  PerformAsCurrentDrawingAppearance(AppearanceForKey(key), load_colors);
+ }
+ 
+ void AddNativeColorSetInColorMixer(ColorMixer& mixer) {
+@@ -131,8 +153,16 @@ void AddNativeUiColorMixer(ColorProvider* provider,
+ 
+     AddNativeColorSetInColorMixer(mixer);
+ 
+-    mixer[kColorTableBackgroundAlternate] = {
+-        NSSystemColorToSkColor(NSColor.alternatingContentBackgroundColors[1])};
++    if (@available(macOS 10.14, *)) {
++      mixer[kColorTableBackgroundAlternate] = {NSSystemColorToSkColor(
++          NSColor.alternatingContentBackgroundColors[1])};
++    } else {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++      mixer[kColorTableBackgroundAlternate] = {NSSystemColorToSkColor(
++          NSColor.controlAlternatingRowBackgroundColors[1])};
++#pragma clang diagnostic pop
++    }
+     if (!key.user_color.has_value()) {
+       mixer[kColorSysStateFocusRing] = PickGoogleColor(
+           NSSystemColorToSkColor(NSColor.keyboardFocusIndicatorColor),
+@@ -160,7 +190,7 @@ void AddNativeUiColorMixer(ColorProvider* provider,
+     mixer[kColorTableRowHighlight] = {kColorSysStateHoverOnSubtle};
+   };
+ 
+-  [AppearanceForKey(key) performAsCurrentDrawingAppearance:load_colors];
++  PerformAsCurrentDrawingAppearance(AppearanceForKey(key), load_colors);
+ }
+ 
+ void AddNativePostprocessingMixer(ColorProvider* provider,
+diff --git a/ui/gfx/mac/color_space_util.mm b/ui/gfx/mac/color_space_util.mm
+index 5e2ffd82a29c98b88eeb4d796cdca5ac577f153a..e0f0b9f68979704377e174b2bca1271e727e2ad5 100644
+--- a/ui/gfx/mac/color_space_util.mm
++++ b/ui/gfx/mac/color_space_util.mm
+@@ -154,14 +154,18 @@ bool GetImageBufferProperty(CFTypeRef value_untyped,
+         supported_transfer_funcs.push_back({kCVImageBufferTransferFunction_sRGB,
+                                             nullptr,
+                                             gfx::ColorSpace::TransferID::SRGB});
+-        supported_transfer_funcs.push_back(
+-            {kCVImageBufferTransferFunction_Linear,
+-             kCMFormatDescriptionTransferFunction_Linear,
+-             gfx::ColorSpace::TransferID::LINEAR});
+-        supported_transfer_funcs.push_back(
+-            {kCVImageBufferTransferFunction_sRGB,
+-             kCMFormatDescriptionTransferFunction_sRGB,
+-             gfx::ColorSpace::TransferID::SRGB});
++        if (@available(macOS 10.14, *)) {
++          supported_transfer_funcs.push_back(
++              {kCVImageBufferTransferFunction_Linear,
++               kCMFormatDescriptionTransferFunction_Linear,
++               gfx::ColorSpace::TransferID::LINEAR});
++        }
++        if (@available(macOS 10.15, *)) {
++          supported_transfer_funcs.push_back(
++              {kCVImageBufferTransferFunction_sRGB,
++               kCMFormatDescriptionTransferFunction_sRGB,
++               gfx::ColorSpace::TransferID::SRGB});
++        }
+ 
+         return supported_transfer_funcs;
+       }());
+diff --git a/ui/gfx/mac/io_surface.cc b/ui/gfx/mac/io_surface.cc
+index 1a3e4a3284ea2e9713bfdf18d5dbefdabc0d381c..1ee2c899096b6c84f4721ea317a75daff77758a0 100644
+--- a/ui/gfx/mac/io_surface.cc
++++ b/ui/gfx/mac/io_surface.cc
+@@ -312,12 +312,16 @@ bool IOSurfaceSetColorSpace(IOSurfaceRef io_surface,
+                                 ColorSpace::TransferID::PQ,
+                                 ColorSpace::MatrixID::BT2020_NCL,
+                                 ColorSpace::RangeID::LIMITED)) {
+-    color_space_name = kCGColorSpaceITUR_2100_PQ;
++    if (__builtin_available(macOS 11.0, *)) {
++      color_space_name = kCGColorSpaceITUR_2100_PQ;
++    }
+   } else if (color_space == ColorSpace(ColorSpace::PrimaryID::BT2020,
+                                        ColorSpace::TransferID::HLG,
+                                        ColorSpace::MatrixID::BT2020_NCL,
+                                        ColorSpace::RangeID::LIMITED)) {
+-    color_space_name = kCGColorSpaceITUR_2100_HLG;
++    if (__builtin_available(macOS 11.0, *)) {
++      color_space_name = kCGColorSpaceITUR_2100_HLG;
++    }
+   }
+ 
+   // https://crbug.com/1488397: Set parameters that will be rendering YUV
+diff --git a/ui/gfx/mac/mtl_shared_event_fence.h b/ui/gfx/mac/mtl_shared_event_fence.h
+index c64c31a7d82b6acbb3ade82fcae48f02d976250c..686b917e8901d5a36a336d17b11e382f48fb285f 100644
+--- a/ui/gfx/mac/mtl_shared_event_fence.h
++++ b/ui/gfx/mac/mtl_shared_event_fence.h
+@@ -36,9 +36,14 @@ class COMPONENT_EXPORT(GFX) MTLSharedEventFence {
+       std::vector<MTLSharedEventFence> fences);
+ 
+ #if defined(__OBJC__)
++  // MTLSharedEvent needs macOS 10.14, but a fence only holds an event that
++  // its creator already got from a newer Metal API.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+   MTLSharedEventFence(id<MTLSharedEvent> shared_event, uint64_t fence_value);
+ 
+   id<MTLSharedEvent> GetSharedEvent() const;
++#pragma clang diagnostic pop
+ #endif
+ 
+   uint64_t fence_value() const { return fence_value_; }
+diff --git a/ui/gfx/mac/mtl_shared_event_fence.mm b/ui/gfx/mac/mtl_shared_event_fence.mm
+index cb98e2debec7e3ea192ae3280db1070e2e06aadb..5f0d155167ba73df994b1149893e83bab14285dd 100644
+--- a/ui/gfx/mac/mtl_shared_event_fence.mm
++++ b/ui/gfx/mac/mtl_shared_event_fence.mm
+@@ -7,6 +7,12 @@
+ #include "base/check.h"
+ #include "base/containers/flat_map.h"
+ 
++// MTLSharedEvent needs macOS 10.14. Fences only hold events that their
++// creators already got from a newer Metal API, so this file never touches
++// one on older releases.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace gfx {
+ 
+ struct MTLSharedEventFence::ObjCStorage {
+@@ -57,3 +63,5 @@ explicit ObjCStorage(id<MTLSharedEvent> shared_event)
+ }
+ 
+ }  // namespace gfx
++
++#pragma clang diagnostic pop
