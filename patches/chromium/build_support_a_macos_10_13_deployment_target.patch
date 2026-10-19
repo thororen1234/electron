@@ -35,9 +35,53 @@ and HDR color space names that newer releases added are only used where
 they exist. MTLSharedEventFence only holds events created by newer Metal
 APIs, so it doesn't need its own checks.
 
+UTType from UniformTypeIdentifiers needs macOS 11. base/mac/uttype_compat
+wraps the type lookups that callers need, using UTType where it exists
+and the Launch Services UTType functions it replaced before that, and the
+Services menu and MIME type code compare type identifiers instead. Other
+macOS 10.14 through 13 APIs are checked at runtime with the fallback that
+Chromium used before dropping those releases where one exists, such as
+SCNetworkReachability, CVBufferGetAttachment(), CGDisplayModeGetRefreshRate()
+and the NSWorkspace URL opening API. Permission checks that didn't exist
+on older releases report access as granted.
+
+Features that need a newer release are turned off there instead:
+ScreenCaptureKit audio capture before macOS 13, the GameController based
+gamepad fetcher before macOS 11, the HDR copier, Bluetooth permission,
+text-to-speech and photo capture before macOS 10.15 or 10.14. Files only
+reached behind those checks, or behind existing ScreenCaptureKit and
+CoreML ones, build without the unguarded availability warning.
+
+kern.osproductversion only exists from macOS 10.13.4, so derive the macOS
+version from the Darwin version before that. setsockopt(IP_DONTFRAG) is
+only used on macOS 11 and later again.
+
 This patch is needed for macOS 10.13 support and is not suitable for
 upstreaming.
 
+diff --git a/base/BUILD.gn b/base/BUILD.gn
+index 8b0156bbda258059e58c086c3b334cdb8a4624af..3b6102f8b9b3af744b8c5586da69b4ef7c6956f1 100644
+--- a/base/BUILD.gn
++++ b/base/BUILD.gn
+@@ -2183,6 +2183,8 @@ component("base") {
+       "mac/login_util.h",
+       "mac/mac_util.h",
+       "mac/mac_util.mm",
++      "mac/uttype_compat.h",
++      "mac/uttype_compat.mm",
+       "mac/os_crash_dumps.cc",
+       "mac/os_crash_dumps.h",
+       "mac/pasteboard_changed_observation.h",
+@@ -2242,6 +2244,9 @@ component("base") {
+       "IOKit.framework",
+       "OpenDirectory.framework",
+     ]
++
++    # Used by mac/uttype_compat.mm on macOS 11 and later only.
++    weak_frameworks = [ "UniformTypeIdentifiers.framework" ]
+   }
+ 
+   # iOS
 diff --git a/base/files/drive_info_mac.cc b/base/files/drive_info_mac.cc
 index 2c95cfbf92daa54f031991c9842f2341ae9c3b32..4860e5b19483e6ad475db8a034d921bc04d2cb6c 100644
 --- a/base/files/drive_info_mac.cc
@@ -173,10 +217,55 @@ index 832ba7c14d0b62124bdbdca4122286403c9756a9..50c275e713e3ef37e95690b7c899e210
  
  }  // namespace base::mac
 diff --git a/base/mac/mac_util.mm b/base/mac/mac_util.mm
-index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..6295686627de12000e7dc81dfdee8ba94d3afb8d 100644
+index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..ff7194b1dccb3c47386c2943361e4df3690a5912 100644
 --- a/base/mac/mac_util.mm
 +++ b/base/mac/mac_util.mm
-@@ -430,7 +430,7 @@ CPUType GetCPUType() {
+@@ -15,6 +15,7 @@
+ #include <sys/utsname.h>
+ #include <sys/xattr.h>
+ 
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -25,6 +26,7 @@
+ #include "base/apple/osstatus_logging.h"
+ #include "base/apple/scoped_cftyperef.h"
+ #include "base/check.h"
++#include "base/check_op.h"
+ #include "base/files/file_path.h"
+ #include "base/logging.h"
+ #include "base/mac/scoped_aedesc.h"
+@@ -367,8 +369,26 @@ int ParseOSProductVersionForTesting(const std::string_view& version) {
+ }
+ 
+ int MacOSVersion() {
+-  static int macos_version = ParseOSProductVersion(
+-      StringSysctlByName("kern.osproductversion").value());
++  static int macos_version = [] {
++    if (std::optional<std::string> product_version =
++            StringSysctlByName("kern.osproductversion")) {
++      return ParseOSProductVersion(*product_version);
++    }
++
++    // kern.osproductversion only exists from macOS 10.13.4. Before that,
++    // derive the version from the Darwin version: Darwin 17.x is macOS 10.13
++    // and its minor version is the macOS bugfix version.
++    std::string os_release = StringSysctlByName("kern.osrelease").value();
++    std::vector<std::string_view> parts = base::SplitStringPiece(
++        os_release, ".", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++    int darwin_major = 0;
++    int darwin_minor = 0;
++    CHECK_GE(parts.size(), 2u);
++    CHECK(base::StringToInt(parts[0], &darwin_major));
++    CHECK(base::StringToInt(parts[1], &darwin_minor));
++    CHECK_LT(darwin_major, 20);
++    return 10'00'00 + (darwin_major - 4) * 1'00 + darwin_minor;
++  }();
+ 
+   return macos_version;
+ }
+@@ -430,7 +450,7 @@ CPUType GetCPUType() {
  
  std::string GetPlatformSerialNumber() {
    base::mac::ScopedIOObject<io_service_t> expert_device(
@@ -185,7 +274,7 @@ index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..6295686627de12000e7dc81dfdee8ba9
                                    IOServiceMatching("IOPlatformExpertDevice")));
    if (!expert_device) {
      DLOG(ERROR) << "Error retrieving the machine serial number.";
-@@ -547,10 +547,14 @@ void OpenSystemSettingsPane(SystemSettingsPane pane,
+@@ -547,10 +567,14 @@ void OpenSystemSettingsPane(SystemSettingsPane pane,
        NOTREACHED();
    }
  
@@ -204,6 +293,175 @@ index 4635a9a267cffcb816ce6cdffe2d73da5736e43a..6295686627de12000e7dc81dfdee8ba9
  }
  
  }  // namespace base::mac
+diff --git a/base/mac/uttype_compat.h b/base/mac/uttype_compat.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f3445dd2069085d9754bc4a082869312588b70a
+--- /dev/null
++++ b/base/mac/uttype_compat.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef BASE_MAC_UTTYPE_COMPAT_H_
++#define BASE_MAC_UTTYPE_COMPAT_H_
++
++#import <Foundation/Foundation.h>
++
++#include "base/base_export.h"
++
++// UTType from UniformTypeIdentifiers needs macOS 11. These functions work on
++// UTType identifier strings instead, using UTType where it exists and the
++// Launch Services UTType functions it replaced before that.
++
++namespace base::mac {
++
++// Returns the identifier of the type for a filename extension (without the
++// leading dot) or a MIME type. As with UTType, these return a dynamic type
++// for tags that the system doesn't know.
++BASE_EXPORT NSString* UTTypeIdentifierForFilenameExtension(
++    NSString* extension);
++BASE_EXPORT NSString* UTTypeIdentifierForMIMEType(NSString* mime_type);
++
++// Returns the preferred filename extension or MIME type of a type, or nil.
++BASE_EXPORT NSString* UTTypePreferredFilenameExtension(NSString* identifier);
++BASE_EXPORT NSString* UTTypePreferredMIMEType(NSString* identifier);
++
++// Returns the localized description of a type, or nil.
++BASE_EXPORT NSString* UTTypeLocalizedDescription(NSString* identifier);
++
++// Returns whether a type is dynamic, i.e. made up by the system for an unknown
++// tag.
++BASE_EXPORT bool UTTypeIsDynamic(NSString* identifier);
++
++// Returns whether a type conforms to another type. Returns false if either is
++// nil.
++BASE_EXPORT bool UTTypeConformsTo(NSString* identifier,
++                                  NSString* conforms_to_identifier);
++
++// Returns the identifier of the content type of the file at `url`, or nil.
++BASE_EXPORT NSString* UTTypeIdentifierForFileURL(NSURL* url);
++
++}  // namespace base::mac
++
++#endif  // BASE_MAC_UTTYPE_COMPAT_H_
+diff --git a/base/mac/uttype_compat.mm b/base/mac/uttype_compat.mm
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7a48f6c8349bd956a7627936f00cbe1b1c0cbf6
+--- /dev/null
++++ b/base/mac/uttype_compat.mm
+@@ -0,0 +1,111 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#import "base/mac/uttype_compat.h"
++
++#import <CoreServices/CoreServices.h>
++#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
++
++#include "base/apple/bridging.h"
++#include "base/apple/scoped_cftyperef.h"
++
++namespace base::mac {
++
++namespace {
++
++NSString* LegacyIdentifierForTag(CFStringRef tag_class, NSString* tag) {
++  if (!tag) {
++    return nil;
++  }
++  return apple::CFToNSOwnershipCast(UTTypeCreatePreferredIdentifierForTag(
++      tag_class, apple::NSToCFPtrCast(tag), /*inConformingToUTI=*/nullptr));
++}
++
++NSString* LegacyPreferredTag(NSString* identifier, CFStringRef tag_class) {
++  if (!identifier) {
++    return nil;
++  }
++  return apple::CFToNSOwnershipCast(UTTypeCopyPreferredTagWithClass(
++      apple::NSToCFPtrCast(identifier), tag_class));
++}
++
++}  // namespace
++
++NSString* UTTypeIdentifierForFilenameExtension(NSString* extension) {
++  if (@available(macOS 11.0, *)) {
++    return [UTType typeWithFilenameExtension:extension].identifier;
++  }
++  return LegacyIdentifierForTag(kUTTagClassFilenameExtension, extension);
++}
++
++NSString* UTTypeIdentifierForMIMEType(NSString* mime_type) {
++  if (@available(macOS 11.0, *)) {
++    return [UTType typeWithMIMEType:mime_type].identifier;
++  }
++  return LegacyIdentifierForTag(kUTTagClassMIMEType, mime_type);
++}
++
++NSString* UTTypePreferredFilenameExtension(NSString* identifier) {
++  if (@available(macOS 11.0, *)) {
++    return [UTType typeWithIdentifier:identifier].preferredFilenameExtension;
++  }
++  return LegacyPreferredTag(identifier, kUTTagClassFilenameExtension);
++}
++
++NSString* UTTypePreferredMIMEType(NSString* identifier) {
++  if (@available(macOS 11.0, *)) {
++    return [UTType typeWithIdentifier:identifier].preferredMIMEType;
++  }
++  return LegacyPreferredTag(identifier, kUTTagClassMIMEType);
++}
++
++NSString* UTTypeLocalizedDescription(NSString* identifier) {
++  if (@available(macOS 11.0, *)) {
++    return [UTType typeWithIdentifier:identifier].localizedDescription;
++  }
++  if (!identifier) {
++    return nil;
++  }
++  return apple::CFToNSOwnershipCast(
++      UTTypeCopyDescription(apple::NSToCFPtrCast(identifier)));
++}
++
++bool UTTypeIsDynamic(NSString* identifier) {
++  if (@available(macOS 11.0, *)) {
++    return [UTType typeWithIdentifier:identifier].dynamic;
++  }
++  return identifier && ::UTTypeIsDynamic(apple::NSToCFPtrCast(identifier));
++}
++
++bool UTTypeConformsTo(NSString* identifier, NSString* conforms_to_identifier) {
++  if (!identifier || !conforms_to_identifier) {
++    return false;
++  }
++  if (@available(macOS 11.0, *)) {
++    UTType* type = [UTType typeWithIdentifier:identifier];
++    UTType* conforms_to = [UTType typeWithIdentifier:conforms_to_identifier];
++    return type && conforms_to && [type conformsToType:conforms_to];
++  }
++  return ::UTTypeConformsTo(apple::NSToCFPtrCast(identifier),
++                            apple::NSToCFPtrCast(conforms_to_identifier));
++}
++
++NSString* UTTypeIdentifierForFileURL(NSURL* url) {
++  if (@available(macOS 11.0, *)) {
++    UTType* type;
++    if ([url getResourceValue:&type forKey:NSURLContentTypeKey error:nil]) {
++      return type.identifier;
++    }
++    return nil;
++  }
++  NSString* identifier;
++  if ([url getResourceValue:&identifier
++                     forKey:NSURLTypeIdentifierKey
++                      error:nil]) {
++    return identifier;
++  }
++  return nil;
++}
++
++}  // namespace base::mac
 diff --git a/base/power_monitor/battery_level_provider_mac.mm b/base/power_monitor/battery_level_provider_mac.mm
 index e4cbd05baeccab8107058042bf41b74425b36dbe..9939b4a5f0ab2fc69a8fa0a42091b1de13210412 100644
 --- a/base/power_monitor/battery_level_provider_mac.mm
@@ -424,6 +682,71 @@ index 8e302f1a1641ff8df50dd5f079b267f98f943c84..72a9b9f5069e331bfd02191ed4be1505
                                     disk_iterator.InitializeInto()) !=
        KERN_SUCCESS) {
      LOG(ERROR) << "Unable to get disk services.";
+diff --git a/chrome/browser/icon_loader_mac.mm b/chrome/browser/icon_loader_mac.mm
+index 76c7651e00a55a9e480d1cf20cc1094002c0b9c1..b4417ee32188e89882ac59e64f9e29592dcb6950 100644
+--- a/chrome/browser/icon_loader_mac.mm
++++ b/chrome/browser/icon_loader_mac.mm
+@@ -10,6 +10,7 @@
+ #include "base/apple/foundation_util.h"
+ #include "base/apple/scoped_cftyperef.h"
+ #include "base/files/file_path.h"
++#include "base/mac/uttype_compat.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/task/thread_pool.h"
+@@ -25,12 +26,10 @@
+   // The last and worst option is to fall back to `public.content` which will
+   // give a generic file icon.
+ 
+-  UTType* type;
+   NSURL* file_url = base::apple::FilePathToNSURL(file_path);
+-  if (file_url && [file_url getResourceValue:&type
+-                                      forKey:NSURLContentTypeKey
+-                                       error:nil]) {
+-    return base::SysNSStringToUTF8(type.identifier);
++  if (NSString* type =
++          file_url ? base::mac::UTTypeIdentifierForFileURL(file_url) : nil) {
++    return base::SysNSStringToUTF8(type);
+   }
+ 
+   std::string extension_string = file_path.FinalExtension();
+@@ -38,14 +37,14 @@
+     // Remove the leading dot.
+     extension_string.erase(extension_string.begin());
+ 
+-    type = [UTType
+-        typeWithFilenameExtension:base::SysUTF8ToNSString(extension_string)];
+-    if (type) {
+-      return base::SysNSStringToUTF8(type.identifier);
++    if (NSString* type = base::mac::UTTypeIdentifierForFilenameExtension(
++            base::SysUTF8ToNSString(extension_string))) {
++      return base::SysNSStringToUTF8(type);
+     }
+   }
+ 
+-  return base::SysNSStringToUTF8(UTTypeContent.identifier);
++  // The identifier of UTTypeContent, which needs macOS 11.
++  return "public.content";
+ }
+ 
+ // static
+@@ -55,8 +54,14 @@
+ }
+ 
+ void IconLoader::ReadIcon() {
+-  UTType* type = [UTType typeWithIdentifier:base::SysUTF8ToNSString(group_)];
+-  NSImage* icon = [NSWorkspace.sharedWorkspace iconForContentType:type];
++  NSImage* icon;
++  if (@available(macOS 11.0, *)) {
++    UTType* type = [UTType typeWithIdentifier:base::SysUTF8ToNSString(group_)];
++    icon = [NSWorkspace.sharedWorkspace iconForContentType:type];
++  } else {
++    icon = [NSWorkspace.sharedWorkspace
++        iconForFileType:base::SysUTF8ToNSString(group_)];
++  }
+ 
+   gfx::Image image;
+   if (icon_size_ == ALL) {
 diff --git a/chrome/browser/mac/install_from_dmg.mm b/chrome/browser/mac/install_from_dmg.mm
 index b822ec667f7a05b75312e275c7d3af0acf75d6c3..8d65db04c3c83cfc1fb3c0c53f53a1bbeed78c93 100644
 --- a/chrome/browser/mac/install_from_dmg.mm
@@ -446,6 +769,216 @@ index b822ec667f7a05b75312e275c7d3af0acf75d6c3..8d65db04c3c83cfc1fb3c0c53f53a1bb
    if (kr != KERN_SUCCESS) {
      MACH_LOG(ERROR, kr) << "IOServiceGetMatchingServices";
      return {.status = DiskImageStatus::kFailure};
+diff --git a/chrome/browser/media/webrtc/thumbnail_capturer_mac.mm b/chrome/browser/media/webrtc/thumbnail_capturer_mac.mm
+index 027ebbae23ec8ba766ccfd21ae98ef3400a24122..d78a27154f1a72371bd1782d39de340cd4c28e7b 100644
+--- a/chrome/browser/media/webrtc/thumbnail_capturer_mac.mm
++++ b/chrome/browser/media/webrtc/thumbnail_capturer_mac.mm
+@@ -48,6 +48,12 @@
+     base::RepeatingCallback<void(base::apple::ScopedCFTypeRef<CGImageRef> image,
+                                  ThumbnailCapturer::SourceId source_id)>;
+ 
++// ScreenCaptureKit needs macOS 12.3. Everything here is only reached once
++// callers have checked for macOS 13.2 or later, so availability is not
++// checked again for each use.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace {
+ 
+ // These features enable the use of ScreenCaptureKit to produce thumbnails in
+@@ -954,3 +960,5 @@ bool ShouldUseThumbnailCapturerMac(DesktopMediaList::Type type) {
+   }
+   NOTREACHED();
+ }
++
++#pragma clang diagnostic pop
+diff --git a/chrome/browser/permissions/system/media_authorization_wrapper_mac.h b/chrome/browser/permissions/system/media_authorization_wrapper_mac.h
+index 503fe85df2689cf99250de44133f01a027b90508..820ff9d4ce84d2677b3c9ad30290e8a2528385f4 100644
+--- a/chrome/browser/permissions/system/media_authorization_wrapper_mac.h
++++ b/chrome/browser/permissions/system/media_authorization_wrapper_mac.h
+@@ -10,6 +10,12 @@
+ 
+ #include "base/functional/callback_forward.h"
+ 
++// AVAuthorizationStatus is only an enum before macOS 10.14, which has no
++// media capture permissions. The AVCaptureDevice calls are checked at
++// runtime, so the type and its values are used unguarded.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace system_permission_settings {
+ 
+ class MediaAuthorizationWrapper {
+@@ -24,4 +30,6 @@ class MediaAuthorizationWrapper {
+ 
+ }  // namespace system_permission_settings
+ 
++#pragma clang diagnostic pop
++
+ #endif  // CHROME_BROWSER_PERMISSIONS_SYSTEM_MEDIA_AUTHORIZATION_WRAPPER_MAC_H_
+diff --git a/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm b/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm
+index 56d14662a002fe506ff4e769e07ac67289b35b9a..56215541ed6389311b76263a9a14f132baa75600 100644
+--- a/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm
++++ b/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm
+@@ -21,6 +21,12 @@
+ #include "media/base/media_switches.h"
+ #include "ui/base/cocoa/permissions_utils.h"
+ 
++// AVAuthorizationStatus is only an enum before macOS 10.14, which has no
++// media capture permissions. The AVCaptureDevice calls are checked at
++// runtime, so the type and its values are used unguarded.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace system_permission_settings {
+ 
+ namespace {
+@@ -48,11 +54,22 @@ bool UsingFakeMediaDevices() {
+ 
+   AVAuthorizationStatus AuthorizationStatusForMediaType(
+       AVMediaType media_type) override {
+-    return [AVCaptureDevice authorizationStatusForMediaType:media_type];
++    if (@available(macOS 10.14, *)) {
++      return [AVCaptureDevice authorizationStatusForMediaType:media_type];
++    }
++    // There are no media capture permissions before macOS 10.14.
++    return AVAuthorizationStatusAuthorized;
+   }
+ 
+   void RequestAccessForMediaType(AVMediaType media_type,
+                                  base::OnceClosure callback) override {
++    if (@available(macOS 10.14, *)) {
++    } else {
++      // There are no media capture permissions before macOS 10.14.
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, std::move(callback));
++      return;
++    }
+     __block base::OnceClosure block_callback = std::move(callback);
+     __block scoped_refptr<base::SequencedTaskRunner> requesting_thread =
+         base::SequencedTaskRunner::GetCurrentDefault();
+@@ -180,3 +197,5 @@ void SetIsScreenCaptureAllowedForTesting(bool is_screen_capture_allowed) {
+ }
+ 
+ }  // namespace system_permission_settings
++
++#pragma clang diagnostic pop
+diff --git a/chrome/browser/platform_util_mac.mm b/chrome/browser/platform_util_mac.mm
+index 390d63ffee79b337e43ce5103757b5184700c560..c71f32963c5bfe48dd9d53ba6a919434f8110b94 100644
+--- a/chrome/browser/platform_util_mac.mm
++++ b/chrome/browser/platform_util_mac.mm
+@@ -53,16 +53,36 @@ void ShowItemInFolder(Profile* profile, const base::FilePath& full_path) {
+   [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ url ]];
+ }
+ 
++namespace {
++
++// NSWorkspaceOpenConfiguration needs macOS 10.15. Before that, open the URL
++// synchronously.
++void WorkspaceOpenURL(NSURL* url,
++                      void (^completion_handler)(NSRunningApplication*,
++                                                 NSError*)) {
++  if (@available(macOS 10.15, *)) {
++    [[NSWorkspace sharedWorkspace]
++                  openURL:url
++            configuration:[NSWorkspaceOpenConfiguration configuration]
++        completionHandler:completion_handler];
++    return;
++  }
++  if (![[NSWorkspace sharedWorkspace] openURL:url] && completion_handler) {
++    completion_handler(nil, [NSError errorWithDomain:NSCocoaErrorDomain
++                                                code:NSFileReadUnknownError
++                                            userInfo:nil]);
++  }
++}
++
++}  // namespace
++
+ void OpenFileOnMainThread(const base::FilePath& full_path) {
+   DCHECK([NSThread isMainThread]);
+   NSURL* url = base::apple::FilePathToNSURL(full_path);
+   if (!url)
+     return;
+ 
+-  [[NSWorkspace sharedWorkspace]
+-                openURL:url
+-          configuration:[NSWorkspaceOpenConfiguration configuration]
+-      completionHandler:nil];
++  WorkspaceOpenURL(url, nil);
+ }
+ 
+ namespace internal {
+@@ -81,10 +101,7 @@ void PlatformOpenVerifiedItem(const base::FilePath& path, OpenItemType type) {
+       // Note that there exists a TOCTOU race between the time that |path| was
+       // verified as being a directory and when NSWorkspace invokes Finder (or
+       // alternative) to open |path_string|.
+-      [[NSWorkspace sharedWorkspace]
+-                    openURL:url
+-              configuration:[NSWorkspaceOpenConfiguration configuration]
+-          completionHandler:nil];
++      WorkspaceOpenURL(url, nil);
+       return;
+   }
+ }
+@@ -101,14 +118,11 @@ void OpenExternal(const GURL& url) {
+   }
+ 
+   std::string url_string = url.possibly_invalid_spec();
+-  [[NSWorkspace sharedWorkspace]
+-                openURL:ns_url
+-          configuration:[NSWorkspaceOpenConfiguration configuration]
+-      completionHandler:^(NSRunningApplication* app, NSError* error) {
+-        if (error) {
+-          LOG(WARNING) << "NSWorkspace failed to open URL " << url_string;
+-        }
+-      }];
++  WorkspaceOpenURL(ns_url, ^(NSRunningApplication* app, NSError* error) {
++    if (error) {
++      LOG(WARNING) << "NSWorkspace failed to open URL " << url_string;
++    }
++  });
+ }
+ 
+ gfx::NativeWindow GetTopLevel(gfx::NativeView view) {
+diff --git a/chrome/browser/ui/views/eye_dropper/eye_dropper_view_mac.mm b/chrome/browser/ui/views/eye_dropper/eye_dropper_view_mac.mm
+index 05c4cd9d89ff294b38c88a6f9bdf0640d45e1cde..e626bef647f63d91701c96cd1aa437a3679ee69b 100644
+--- a/chrome/browser/ui/views/eye_dropper/eye_dropper_view_mac.mm
++++ b/chrome/browser/ui/views/eye_dropper/eye_dropper_view_mac.mm
+@@ -13,11 +13,28 @@
+ #include "skia/ext/skia_utils_mac.h"
+ #include "ui/base/ui_base_features.h"
+ 
++// NSColorSampler needs macOS 10.15. EyeDropperViewMac checks for it before
++// creating one, so its uses are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ EyeDropperViewMac::EyeDropperViewMac(content::EyeDropperListener* listener)
+     : listener_(listener), weak_ptr_factory_(this) {
+   if (!listener_) {
+     return;
+   }
++  if (@available(macOS 10.15, *)) {
++  } else {
++    // NSColorSampler needs macOS 10.15, so cancel the selection.
++    base::WeakPtr<EyeDropperViewMac> weak_this =
++        weak_ptr_factory_.GetWeakPtr();
++    dispatch_async(dispatch_get_main_queue(), ^{
++      if (weak_this) {
++        weak_this->listener_->ColorSelectionCanceled();
++      }
++    });
++    return;
++  }
+   color_sampler_ = [[NSColorSampler alloc] init];
+   // Used to ensure that EyeDropperViewMac is still alive when the handler is
+   // called.
+@@ -57,3 +74,5 @@
+ 
+   return std::make_unique<EyeDropperViewMac>(listener);
+ }
++
++#pragma clang diagnostic pop
 diff --git a/chrome/utility/image_writer/image_writer_mac.cc b/chrome/utility/image_writer/image_writer_mac.cc
 index 7a8dbd06b5b7eab1bb86bace831f5026b9566c55..a12e3de47ac0977f8d288b584aff662104c76bcd 100644
 --- a/chrome/utility/image_writer/image_writer_mac.cc
@@ -459,6 +992,96 @@ index 7a8dbd06b5b7eab1bb86bace831f5026b9566c55..a12e3de47ac0977f8d288b584aff6621
    if (!disk_obj)
      return false;
  
+diff --git a/components/enterprise/platform_auth/url_session_helper.mm b/components/enterprise/platform_auth/url_session_helper.mm
+index 468c4d4dbb4554981eb06645af714622fee02d5b..e43edf1d69ffeeef46b05edd5e4ec5923b8facc5 100644
+--- a/components/enterprise/platform_auth/url_session_helper.mm
++++ b/components/enterprise/platform_auth/url_session_helper.mm
+@@ -140,12 +140,28 @@ bool MatchOktaSSOUrlPattern(std::string_view path) {
+   return body_data;
+ }
+ 
++// Returns the value of a header in `http_response`, matching its name
++// case-insensitively. -[NSHTTPURLResponse valueForHTTPHeaderField:] needs
++// macOS 10.15.
++NSString* GetHeaderValue(NSHTTPURLResponse* http_response, NSString* name) {
++  if (@available(macOS 10.15, *)) {
++    return [http_response valueForHTTPHeaderField:name];
++  }
++  NSDictionary* header_fields = http_response.allHeaderFields;
++  for (NSString* key in header_fields) {
++    if ([key caseInsensitiveCompare:name] == NSOrderedSame) {
++      return header_fields[key];
++    }
++  }
++  return nil;
++}
++
+ // Returns lower-case normalised values specified by the
+ // Access-Control-Allow-Origin header in the `http_response`.
+ std::vector<std::string> ParseAccessControlAllowHeaders(
+     NSHTTPURLResponse* http_response) {
+   NSString* ns_access_control_allow_headers =
+-      [http_response valueForHTTPHeaderField:@("access-control-allow-headers")];
++      GetHeaderValue(http_response, @("access-control-allow-headers"));
+ 
+   std::vector<std::string> allowed_headers;
+   if (ns_access_control_allow_headers) {
+@@ -186,7 +202,7 @@ bool MatchOktaSSOUrlPattern(std::string_view path) {
+   // request_initiator.
+   // valueForHTTPHeaderField is NOT case-sensitive.
+   NSString* ns_allowed_origin =
+-      [http_response valueForHTTPHeaderField:@("access-control-allow-origin")];
++      GetHeaderValue(http_response, @("access-control-allow-origin"));
+   if (!ns_allowed_origin) {
+     LOG_POLICY(ERROR, EXTENSIBLE_SSO)
+         << "[OktaEnterpriseSSO] SSO URL request response rejected because the "
+@@ -214,8 +230,8 @@ bool MatchOktaSSOUrlPattern(std::string_view path) {
+   std::vector<std::pair<std::string, std::string>> headers_to_add;
+   headers_to_add.reserve(allowed_headers.size());
+   for (const std::string& allowed_header : allowed_headers) {
+-    NSString* ns_value = [http_response
+-        valueForHTTPHeaderField:base::SysUTF8ToNSString(allowed_header)];
++    NSString* ns_value =
++        GetHeaderValue(http_response, base::SysUTF8ToNSString(allowed_header));
+     if (!ns_value) {
+       continue;
+     }
+diff --git a/components/metal_util/hdr_copier_layer.mm b/components/metal_util/hdr_copier_layer.mm
+index 5e9bca9a978790bf5f533d3aa64b1ecf405eeb39..f01fb6af631e627288c59793b61538b8f08011d0 100644
+--- a/components/metal_util/hdr_copier_layer.mm
++++ b/components/metal_util/hdr_copier_layer.mm
+@@ -269,6 +269,12 @@ bool IOSurfaceGetMTLPixelFormat(IOSurfaceRef buffer,
+ 
+ }  // namespace
+ 
++// HDRCopierLayer uses macOS 10.15 APIs. It is only created when
++// ShouldUseHDRCopier() returns true, which checks for macOS 10.15, so
++// its uses are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ @interface HDRCopierLayer : CAMetalLayer
+ - (id)init;
+ - (void)setHDRContents:(IOSurfaceRef)buffer
+@@ -532,6 +538,12 @@ void UpdateHDRCopierLayer(CALayer* layer,
+ bool ShouldUseHDRCopier(IOSurfaceRef buffer,
+                         const gfx::HDRMetadata& hdr_metadata,
+                         const gfx::ColorSpace& color_space) {
++  // HDRCopierLayer uses CAEDRMetadata and other macOS 10.15 APIs.
++  if (@available(macOS 10.15, *)) {
++  } else {
++    return false;
++  }
++
+   // Only some transfer functions are supported.
+   if (!GetTransferFunctionIndex(color_space)) {
+     return false;
+@@ -576,3 +588,5 @@ bool ShouldUseHDRCopier(IOSurfaceRef buffer,
+ }
+ 
+ }  // namespace metal
++
++#pragma clang diagnostic pop
 diff --git a/components/power_metrics/energy_impact_mac.mm b/components/power_metrics/energy_impact_mac.mm
 index f6363793ff5b2f3f077244cb17fc635faf49b183..8dc680794ea889f19c6035c0d4380ff5cdee4af9 100644
 --- a/components/power_metrics/energy_impact_mac.mm
@@ -485,6 +1108,632 @@ index fc1d9f93992c6328b00a4e6832fdb909919f79e7..398b317ced202b4b2c37b887b8d8d57f
                                    IOServiceMatching("AppleSMC")));
    base::mac::ScopedIOObject<io_object_t> connect;
    if (IOServiceOpen(smc_service.get(), mach_task_self(), 1,
+diff --git a/components/remote_cocoa/app_shim/bridged_content_view.mm b/components/remote_cocoa/app_shim/bridged_content_view.mm
+index c8e9717e6612291256d0c12613d5d1cf927b890b..69c7c460252a20cf8b5b051ac499e25f4e9e352f 100644
+--- a/components/remote_cocoa/app_shim/bridged_content_view.mm
++++ b/components/remote_cocoa/app_shim/bridged_content_view.mm
+@@ -1430,15 +1430,16 @@ - (void)cancelOperation:(id)sender {
+ 
+ - (id)validRequestorForSendType:(NSString*)sendType
+                      returnType:(NSString*)returnType {
+-  UTType* sendUTType = ui::UTTypeForServicesType(sendType);
+-  UTType* acceptUTType = ui::UTTypeForServicesType(returnType);
++  // UTTypeUTF8PlainText needs macOS 11, so compare identifiers.
++  NSString* sendUTType = ui::UTTypeIdentifierForServicesType(sendType);
++  NSString* acceptUTType = ui::UTTypeIdentifierForServicesType(returnType);
+ 
+   const BOOL hasTextInputClient = [self hasTextInputClient];
+-  const BOOL canSendText = [sendUTType isEqual:UTTypeUTF8PlainText] &&
++  const BOOL canSendText = [sendUTType isEqual:@"public.utf8-plain-text"] &&
+                            hasTextInputClient &&
+                            [self selectedRange].length > 0;
+   const BOOL canAcceptText =
+-      [acceptUTType isEqual:UTTypeUTF8PlainText] && hasTextInputClient;
++      [acceptUTType isEqual:@"public.utf8-plain-text"] && hasTextInputClient;
+ 
+   // This is a valid requestor if the send/accept types can be fulfilled or if
+   // they are `nil` (and therefore not the wrong type).
+@@ -1452,11 +1453,11 @@ - (id)validRequestorForSendType:(NSString*)sendType
+ // NSServicesMenuRequestor protocol
+ 
+ - (BOOL)writeSelectionToPasteboard:(NSPasteboard*)pboard types:(NSArray*)types {
+-  NSSet<UTType*>* typeSet = ui::UTTypesForServicesTypeArray(types);
++  NSSet<NSString*>* typeSet = ui::UTTypeIdentifiersForServicesTypeArray(types);
+ 
+   bool wasAbleToWriteAtLeastOneType = false;
+ 
+-  if ([typeSet containsObject:UTTypeUTF8PlainText]) {
++  if ([typeSet containsObject:@"public.utf8-plain-text"]) {
+     bool result = false;
+     std::u16string selection_text;
+     if (_bridge)
+diff --git a/components/remote_cocoa/app_shim/immersive_mode_controller_cocoa.mm b/components/remote_cocoa/app_shim/immersive_mode_controller_cocoa.mm
+index a044609059df5bfdf01166d2e72b7288ed220b38..0dde953f0a84684e919f271b8c7d195ab6b27ed2 100644
+--- a/components/remote_cocoa/app_shim/immersive_mode_controller_cocoa.mm
++++ b/components/remote_cocoa/app_shim/immersive_mode_controller_cocoa.mm
+@@ -180,7 +180,9 @@ bool IsNSToolbarFullScreenWindow(NSWindow* window) {
+   // A style of NSTitlebarSeparatorStyleAutomatic (default) will show a black
+   // line separator when removing the NSWindowStyleMaskFullSizeContentView style
+   // bit. We do not want a separator.
+-  browser_window_.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
++  if (@available(macOS 11.0, *)) {
++    browser_window_.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
++  }
+ 
+   // Create a new NSTitlebarAccessoryViewController that will host the
+   // overlay_view_.
+@@ -239,7 +241,9 @@ bool IsNSToolbarFullScreenWindow(NSWindow* window) {
+   overlay_window_.contentView = overlay_content_view_;
+   [immersive_mode_titlebar_view_controller_ removeFromParentViewController];
+   browser_window_.styleMask |= NSWindowStyleMaskFullSizeContentView;
+-  browser_window_.titlebarSeparatorStyle = NSTitlebarSeparatorStyleAutomatic;
++  if (@available(macOS 11.0, *)) {
++    browser_window_.titlebarSeparatorStyle = NSTitlebarSeparatorStyleAutomatic;
++  }
+ }
+ 
+ void ImmersiveModeControllerCocoa::Init() {
+@@ -604,9 +608,12 @@ bool IsNSToolbarFullScreenWindow(NSWindow* window) {
+   // where the y origin is not 0, such as vertically aligned displays. Make sure
+   // to make it past the safe area insets, otherwise some portion of the window
+   // may still be displayed.
++  CGFloat safe_area_top = 0;
++  if (@available(macOS 12.0, *)) {
++    safe_area_top = browser_window_.screen.safeAreaInsets.top;
++  }
+   return browser_window_.screen.frame.size.height +
+-         browser_window_.frame.origin.y +
+-         browser_window_.screen.safeAreaInsets.top;
++         browser_window_.frame.origin.y + safe_area_top;
+ }
+ 
+ void ImmersiveModeControllerCocoa::
+diff --git a/components/remote_cocoa/app_shim/immersive_mode_tabbed_controller_cocoa.mm b/components/remote_cocoa/app_shim/immersive_mode_tabbed_controller_cocoa.mm
+index 95ccf868874b144b9d09955aaf9d33f87987e1f1..ebb2820249cf10a1b3e01f7bc3b6f1966dfdcdca 100644
+--- a/components/remote_cocoa/app_shim/immersive_mode_tabbed_controller_cocoa.mm
++++ b/components/remote_cocoa/app_shim/immersive_mode_tabbed_controller_cocoa.mm
+@@ -88,7 +88,9 @@ void SetAlwaysShowTrafficLights(NSWindow* browser_window, bool always_show) {
+   SetAlwaysShowTrafficLights(browser_window(), false);
+   StopObservingChildWindows(tab_window_);
+   browser_window().toolbar = nil;
+-  browser_window().toolbarStyle = NSWindowToolbarStyleAutomatic;
++  if (@available(macOS 11.0, *)) {
++    browser_window().toolbarStyle = NSWindowToolbarStyleAutomatic;
++  }
+   BridgedContentView* tab_content_view = tab_content_view_;
+   [tab_content_view removeFromSuperview];
+   tab_window_.contentView = tab_content_view;
+@@ -148,7 +150,9 @@ void SetAlwaysShowTrafficLights(NSWindow* browser_window, bool always_show) {
+   // This style is available since macOS 11.0. It is a no-op for Chrome on
+   // pre-macOS 26. However, if Chrome starts using NSToolbarItem in the future,
+   // their height will be affected by this style.
+-  browser_window().toolbarStyle = NSWindowToolbarStyleUnifiedCompact;
++  if (@available(macOS 11.0, *)) {
++    browser_window().toolbarStyle = NSWindowToolbarStyleUnifiedCompact;
++  }
+ 
+   // `UpdateToolbarVisibility()` will make the toolbar visible as necessary.
+   UpdateToolbarVisibility(last_used_style());
+diff --git a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+index 3c1a966c90e17a32a56682f88eb59bb6bffcdd9c..4325773f302f1022bdfacd30dc0490ea87c190fe 100644
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+@@ -1306,10 +1306,13 @@ NSUInteger CountBridgedWindows(NSArray* child_windows) {
+ 
+ void NativeWidgetNSWindowBridge::SetColorMode(
+     ui::ColorProviderKey::ColorMode color_mode) {
+-  NSAppearance* appearance =
+-      color_mode == ui::ColorProviderKey::ColorMode::kLight
+-          ? [NSAppearance appearanceNamed:NSAppearanceNameAqua]
+-          : [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
++  NSAppearance* appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
++  // There is no dark appearance before macOS 10.14.
++  if (@available(macOS 10.14, *)) {
++    if (color_mode != ui::ColorProviderKey::ColorMode::kLight) {
++      appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
++    }
++  }
+   [window_ setAppearance:appearance];
+ }
+ 
+@@ -1867,12 +1870,17 @@ NSUInteger CountBridgedWindows(NSArray* child_windows) {
+ void NativeWidgetNSWindowBridge::SetCanAppearInExistingFullscreenSpaces(
+     bool can_appear_in_existing_fullscreen_spaces) {
+   NSWindowCollectionBehavior collectionBehavior = window_.collectionBehavior;
++  // NSWindowCollectionBehaviorPrimary needs macOS 13.
++  NSWindowCollectionBehavior primary_behavior = 0;
++  if (@available(macOS 13.0, *)) {
++    primary_behavior = NSWindowCollectionBehaviorPrimary;
++  }
+   if (can_appear_in_existing_fullscreen_spaces) {
+-    collectionBehavior &= ~NSWindowCollectionBehaviorPrimary;
++    collectionBehavior &= ~primary_behavior;
+     collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
+     collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenPrimary;
+   } else {
+-    collectionBehavior |= NSWindowCollectionBehaviorPrimary;
++    collectionBehavior |= primary_behavior;
+     collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+     collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
+   }
+diff --git a/components/remote_cocoa/app_shim/select_file_dialog_bridge.mm b/components/remote_cocoa/app_shim/select_file_dialog_bridge.mm
+index decff1306c217f828c00eb1ee83231d0cae62446..54f0e498e08d7d3703aa92f99e8a67ff7cd3f9ab 100644
+--- a/components/remote_cocoa/app_shim/select_file_dialog_bridge.mm
++++ b/components/remote_cocoa/app_shim/select_file_dialog_bridge.mm
+@@ -15,6 +15,7 @@
+ #include "base/files/file_util.h"
+ #include "base/i18n/case_conversion.h"
+ #import "base/mac/mac_util.h"
++#import "base/mac/uttype_compat.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/threading/hang_watcher.h"
+@@ -31,15 +32,14 @@
+ // Returns whether the Uniform Type system considers `ext` to be a valid file
+ // extension.
+ bool IsValidExtension(const base::FilePath::StringType& ext) {
+-  UTType* type =
+-      [UTType typeWithFilenameExtension:base::SysUTF8ToNSString(ext)];
+-  return !!type;
++  return !!base::mac::UTTypeIdentifierForFilenameExtension(
++      base::SysUTF8ToNSString(ext));
+ }
+ 
+ NSString* GetDescriptionFromExtension(const base::FilePath::StringType& ext) {
+-  UTType* type =
+-      [UTType typeWithFilenameExtension:base::SysUTF8ToNSString(ext)];
+-  NSString* description = type.localizedDescription;
++  NSString* description = base::mac::UTTypeLocalizedDescription(
++      base::mac::UTTypeIdentifierForFilenameExtension(
++          base::SysUTF8ToNSString(ext)));
+ 
+   if (description.length) {
+     return description;
+diff --git a/components/system_media_controls/mac/now_playing_info_center_delegate_cocoa.mm b/components/system_media_controls/mac/now_playing_info_center_delegate_cocoa.mm
+index 434bbc2b5584bf9fa5283af1bfac1f6110123f25..bcdcce4fca229552b0fea8caae4e5cc9c16a3ae4 100644
+--- a/components/system_media_controls/mac/now_playing_info_center_delegate_cocoa.mm
++++ b/components/system_media_controls/mac/now_playing_info_center_delegate_cocoa.mm
+@@ -56,8 +56,10 @@ - (void)setPlaybackRate:(NSNumber*)rate {
+ }
+ 
+ - (void)setCurrentPlaybackDate:(NSDate*)date {
+-  [_nowPlayingInfo setObject:date
+-                      forKey:MPNowPlayingInfoPropertyCurrentPlaybackDate];
++  if (@available(macOS 10.13.1, *)) {
++    [_nowPlayingInfo setObject:date
++                        forKey:MPNowPlayingInfoPropertyCurrentPlaybackDate];
++  }
+ }
+ 
+ - (void)setElapsedPlaybackTime:(NSNumber*)time {
+@@ -71,12 +73,14 @@ - (void)setDuration:(NSNumber*)duration {
+ }
+ 
+ - (void)setThumbnail:(NSImage*)image {
+-  MPMediaItemArtwork* artwork = [[MPMediaItemArtwork alloc]
+-      initWithBoundsSize:image.size
+-          requestHandler:^NSImage* _Nonnull(CGSize aSize) {
+-            return image;
+-          }];
+-  [_nowPlayingInfo setObject:artwork forKey:MPMediaItemPropertyArtwork];
++  if (@available(macOS 10.13.2, *)) {
++    MPMediaItemArtwork* artwork = [[MPMediaItemArtwork alloc]
++        initWithBoundsSize:image.size
++            requestHandler:^NSImage* _Nonnull(CGSize aSize) {
++              return image;
++            }];
++    [_nowPlayingInfo setObject:artwork forKey:MPMediaItemPropertyArtwork];
++  }
+ }
+ 
+ - (void)clearMetadata {
+@@ -100,7 +104,9 @@ - (void)initializeNowPlayingInfoValues {
+   [_nowPlayingInfo setObject:@"" forKey:MPMediaItemPropertyTitle];
+   [_nowPlayingInfo setObject:@"" forKey:MPMediaItemPropertyArtist];
+   [_nowPlayingInfo setObject:@"" forKey:MPMediaItemPropertyAlbumTitle];
+-  [_nowPlayingInfo removeObjectForKey:MPMediaItemPropertyArtwork];
++  if (@available(macOS 10.13.2, *)) {
++    [_nowPlayingInfo removeObjectForKey:MPMediaItemPropertyArtwork];
++  }
+ }
+ 
+ - (void)updateNowPlayingInfo {
+diff --git a/content/app_shim_remote_cocoa/render_widget_host_ns_view_bridge.mm b/content/app_shim_remote_cocoa/render_widget_host_ns_view_bridge.mm
+index f886056c3e2c952fec25b848c138cdd0258d6a25..480ac1771f0c39aa82b404955cceb20925886826 100644
+--- a/content/app_shim_remote_cocoa/render_widget_host_ns_view_bridge.mm
++++ b/content/app_shim_remote_cocoa/render_widget_host_ns_view_bridge.mm
+@@ -331,11 +331,15 @@
+     NSString* ns_title =
+         base::SysUTF8ToNSString(title.empty() ? url.spec() : title);
+     NSURL* ns_url = net::NSURLWithGURL(url);
+-    [items addObject:[[NSPreviewRepresentingActivityItem alloc]
+-                         initWithItem:ns_url
+-                                title:ns_title
+-                                image:nil
+-                                 icon:nil]];
++    if (@available(macOS 13.0, *)) {
++      [items addObject:[[NSPreviewRepresentingActivityItem alloc]
++                           initWithItem:ns_url
++                                  title:ns_title
++                                  image:nil
++                                   icon:nil]];
++    } else {
++      [items addObject:ns_url];
++    }
+   } else if (!title.empty()) {
+     [items addObject:base::SysUTF8ToNSString(title)];
+   }
+diff --git a/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm b/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
+index 9eaa36a6bc1536e3a3cb00cf9893b76d9c84f928..42c898161947ac41a5cf7d1c9edb7ab71c6518c5 100644
+--- a/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
++++ b/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
+@@ -2914,12 +2914,13 @@ - (void)finishComposingText {
+ 
+ - (id)validRequestorForSendType:(NSString*)sendType
+                      returnType:(NSString*)returnType {
+-  UTType* sendUTType = ui::UTTypeForServicesType(sendType);
+-  UTType* acceptUTType = ui::UTTypeForServicesType(returnType);
++  // UTTypeUTF8PlainText needs macOS 11, so compare identifiers.
++  NSString* sendUTType = ui::UTTypeIdentifierForServicesType(sendType);
++  NSString* acceptUTType = ui::UTTypeIdentifierForServicesType(returnType);
+ 
+-  const BOOL canSendText = [sendUTType isEqual:UTTypeUTF8PlainText] &&
++  const BOOL canSendText = [sendUTType isEqual:@"public.utf8-plain-text"] &&
+                            !_textSelectionRange.is_empty();
+-  const BOOL canAcceptText = [acceptUTType isEqual:UTTypeUTF8PlainText] &&
++  const BOOL canAcceptText = [acceptUTType isEqual:@"public.utf8-plain-text"] &&
+                              _textInputType != ui::TEXT_INPUT_TYPE_NONE;
+ 
+   // This is a valid requestor if the send/accept types can be fulfilled or if
+@@ -3024,11 +3025,11 @@ @interface RenderWidgetHostViewCocoa (
+ @implementation RenderWidgetHostViewCocoa (NSServicesRequests)
+ 
+ - (BOOL)writeSelectionToPasteboard:(NSPasteboard*)pboard types:(NSArray*)types {
+-  NSSet<UTType*>* typeSet = ui::UTTypesForServicesTypeArray(types);
++  NSSet<NSString*>* typeSet = ui::UTTypeIdentifiersForServicesTypeArray(types);
+ 
+   bool wasAbleToWriteAtLeastOneType = false;
+ 
+-  if ([typeSet containsObject:UTTypeUTF8PlainText] &&
++  if ([typeSet containsObject:@"public.utf8-plain-text"] &&
+       !_textSelectionRange.is_empty()) {
+     NSString* text = base::SysUTF16ToNSString([self selectedText]);
+     wasAbleToWriteAtLeastOneType |= [pboard writeObjects:@[ text ]];
+diff --git a/content/app_shim_remote_cocoa/web_drag_source_mac.mm b/content/app_shim_remote_cocoa/web_drag_source_mac.mm
+index 441f493d374208fbfbecac50ca1766fe400b5627..ba447f1ec70c9ec95ff18fc35983bb7f5d9a6979 100644
+--- a/content/app_shim_remote_cocoa/web_drag_source_mac.mm
++++ b/content/app_shim_remote_cocoa/web_drag_source_mac.mm
+@@ -16,6 +16,7 @@
+ #include "base/files/file.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
++#include "base/mac/uttype_compat.h"
+ #include "base/pickle.h"
+ #include "base/strings/escape.h"
+ #include "base/strings/string_util.h"
+@@ -62,8 +63,9 @@ @implementation WebDragSource {
+   // The URL to download from for a drag-out download.
+   GURL _downloadURL;
+ 
+-  // The file type associated with the file drag, if any.
+-  UTType* __strong _fileType;
++  // The UTType identifier of the file type associated with the file drag, if
++  // any.
++  NSString* __strong _fileType;
+ }
+ 
+ - (instancetype)initWithHost:(remote_cocoa::mojom::WebContentsNSViewHost*)host
+@@ -144,11 +146,12 @@ - (void)webContentsIsGone {
+     }
+ 
+     if (!mimeType.empty()) {
+-      _fileType = [UTType typeWithMIMEType:base::SysUTF8ToNSString(mimeType)];
++      _fileType = base::mac::UTTypeIdentifierForMIMEType(
++          base::SysUTF8ToNSString(mimeType));
+ 
+       // Promise both the file's contents...
+       if (!_dropData.file_contents.empty()) {
+-        [writableTypes addObject:_fileType.identifier];
++        [writableTypes addObject:_fileType];
+       }
+ 
+       // ... and materialization of the file if requested.
+@@ -183,7 +186,7 @@ - (void)webContentsIsGone {
+   // and for JS-constructed File objects. The MIME type is tested to avoid
+   // sending non-image data through the image-specific HTML pasteboard type.)
+   bool hasImageData = !_dropData.file_contents.empty() && _fileType &&
+-                      [_fileType conformsToType:UTTypeImage];
++                      base::mac::UTTypeConformsTo(_fileType, @"public.image");
+   if (hasHTMLData) {
+     if (hasImageData) {
+       [writableTypes addObject:ui::kUTTypeChromiumImageAndHtml];
+@@ -267,7 +270,7 @@ - (id)pasteboardPropertyListForType:(NSPasteboardType)type {
+   }
+ 
+   // File contents.
+-  if ([type isEqualToString:_fileType.identifier]) {
++  if ([type isEqualToString:_fileType]) {
+     return [NSData dataWithBytes:_dropData.file_contents.data()
+                           length:_dropData.file_contents.size()];
+   }
+@@ -275,7 +278,7 @@ - (id)pasteboardPropertyListForType:(NSPasteboardType)type {
+   // File instantiation promise.
+   if ([type isEqualToString:base::apple::CFToNSPtrCast(
+                                 kPasteboardTypeFilePromiseContent)]) {
+-    return _fileType.identifier;
++    return _fileType;
+   }
+   if ([type isEqualToString:base::apple::CFToNSPtrCast(
+                                 kPasteboardTypeFileURLPromise)]) {
+diff --git a/content/browser/media/capture/screen_capture_kit_device_mac.mm b/content/browser/media/capture/screen_capture_kit_device_mac.mm
+index cd61d54472317b435b24c3638a8b3981f0ac18f8..3e2a956bfd917718613a72c15dea85cbd1503fdb 100644
+--- a/content/browser/media/capture/screen_capture_kit_device_mac.mm
++++ b/content/browser/media/capture/screen_capture_kit_device_mac.mm
+@@ -33,6 +33,12 @@
+ using ErrorCallback = base::RepeatingCallback<void(NSError*)>;
+ using CancelCallback = base::RepeatingClosure;
+ 
++// ScreenCaptureKit needs macOS 12.3. Everything here is only reached once
++// callers have checked for macOS 13.2 or later, so availability is not
++// checked again for each use.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ API_AVAILABLE(macos(15.0))
+ @interface ScreenCaptureKitPickerHelper
+     : NSObject <SCContentSharingPickerObserver>
+@@ -912,3 +918,5 @@ void ResetStreamTo(SCWindow* window) override {
+ }
+ 
+ }  // namespace content
++
++#pragma clang diagnostic pop
+diff --git a/content/browser/media/capture/screen_capture_kit_fullscreen_module.h b/content/browser/media/capture/screen_capture_kit_fullscreen_module.h
+index e71685ceec1a32aa8671be0bac64e0d4500f64b7..5821ed31966014e4fb8c3059fa6916ad847c2d10 100644
+--- a/content/browser/media/capture/screen_capture_kit_fullscreen_module.h
++++ b/content/browser/media/capture/screen_capture_kit_fullscreen_module.h
+@@ -13,6 +13,12 @@
+ #include "base/timer/timer.h"
+ #include "content/common/content_export.h"
+ 
++// ScreenCaptureKit needs macOS 12.3. Everything here is only reached once
++// callers have checked for macOS 13.2 or later, so availability is not
++// checked again for each use.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace content {
+ 
+ class CONTENT_EXPORT ScreenCaptureKitResetStreamInterface {
+@@ -112,4 +118,6 @@ MaybeCreateScreenCaptureKitFullscreenModule(
+ 
+ }  // namespace content
+ 
++#pragma clang diagnostic pop
++
+ #endif  // CONTENT_BROWSER_MEDIA_CAPTURE_SCREEN_CAPTURE_KIT_FULLSCREEN_MODULE_H_
+diff --git a/content/browser/media/capture/screen_capture_kit_fullscreen_module.mm b/content/browser/media/capture/screen_capture_kit_fullscreen_module.mm
+index bcda8da42a6c5398de2dbe44a8c55e94d0aae41e..b1617416bc0bb008e07a420df9e7f7e4ab2b18df 100644
+--- a/content/browser/media/capture/screen_capture_kit_fullscreen_module.mm
++++ b/content/browser/media/capture/screen_capture_kit_fullscreen_module.mm
+@@ -11,6 +11,12 @@
+ #import "base/task/single_thread_task_runner.h"
+ #include "content/public/common/content_features.h"
+ 
++// ScreenCaptureKit needs macOS 12.3. Everything here is only reached once
++// callers have checked for macOS 13.2 or later, so availability is not
++// checked again for each use.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace content {
+ namespace {
+ 
+@@ -274,3 +280,5 @@ void LogModeToUma(ScreenCaptureKitFullscreenModule::Mode mode) {
+ }
+ 
+ }  // namespace content
++
++#pragma clang diagnostic pop
+diff --git a/content/browser/speech/tts_mac.h b/content/browser/speech/tts_mac.h
+index 8c3cdbbd893e034da6b6131b2d54d1365bc81c7a..cc1f72c88594632c484b90647e7780c3c23d1f35 100644
+--- a/content/browser/speech/tts_mac.h
++++ b/content/browser/speech/tts_mac.h
+@@ -18,6 +18,12 @@
+ #include "base/threading/sequence_bound.h"
+ #include "content/browser/speech/tts_platform_impl.h"
+ 
++// AVSpeechSynthesizer needs macOS 10.14. TtsPlatformImplMac reports speech
++// synthesis as unsupported and sets nothing up before that, so the uses
++// here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace content {
+ FORWARD_DECLARE_TEST(TtsMacTest, CachedVoiceData);
+ }  // namespace content
+@@ -123,4 +129,6 @@ class TtsPlatformImplMac : public content::TtsPlatformImpl {
+   bool received_voices_request_ GUARDED_BY_CONTEXT(sequence_checker_) = false;
+ };
+ 
++#pragma clang diagnostic pop
++
+ #endif  // CONTENT_BROWSER_SPEECH_TTS_MAC_H_
+diff --git a/content/browser/speech/tts_mac.mm b/content/browser/speech/tts_mac.mm
+index 0b298b566272823b7272ebdd16d1b34883e5a4e0..e48fc724ce46102ef884a7f0865c9b4b59776cf7 100644
+--- a/content/browser/speech/tts_mac.mm
++++ b/content/browser/speech/tts_mac.mm
+@@ -21,6 +21,12 @@
+ #include "base/values.h"
+ #include "content/public/browser/tts_controller.h"
+ 
++// AVSpeechSynthesizer needs macOS 10.14. TtsPlatformImplMac reports speech
++// synthesis as unsupported and sets nothing up before that, so the uses
++// here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace {
+ 
+ constexpr int kNoLength = -1;
+@@ -209,7 +215,11 @@ int GetUtteranceId(AVSpeechUtterance* utterance) {
+ }
+ 
+ bool TtsPlatformImplMac::PlatformImplSupported() {
+-  return true;
++  // AVSpeechSynthesizer needs macOS 10.14.
++  if (@available(macOS 10.14, *)) {
++    return true;
++  }
++  return false;
+ }
+ 
+ bool TtsPlatformImplMac::PlatformImplInitialized() {
+@@ -434,9 +444,15 @@ int GetUtteranceId(AVSpeechUtterance* utterance) {
+   last_char_index_ = char_index;
+ }
+ 
+-TtsPlatformImplMac::TtsPlatformImplMac()
+-    : speech_synthesizer_([[AVSpeechSynthesizer alloc] init]),
+-      delegate_([[ChromeTtsDelegate alloc] initWithPlatformImplMac:this]) {
++TtsPlatformImplMac::TtsPlatformImplMac() {
++  // AVSpeechSynthesizer needs macOS 10.14. Speech synthesis is reported as
++  // unsupported before that, so don't set anything up.
++  if (@available(macOS 10.14, *)) {
++  } else {
++    return;
++  }
++  speech_synthesizer_ = [[AVSpeechSynthesizer alloc] init];
++  delegate_ = [[ChromeTtsDelegate alloc] initWithPlatformImplMac:this];
+   speech_synthesizer_.delegate = delegate_;
+   application_active_observer_ = [NSNotificationCenter.defaultCenter
+       addObserverForName:NSApplicationWillBecomeActiveNotification
+@@ -508,3 +524,5 @@ - (void)speechSynthesizer:(AVSpeechSynthesizer*)synthesizer
+ }
+ 
+ @end
++
++#pragma clang diagnostic pop
+diff --git a/content/browser/theme_helper_mac.mm b/content/browser/theme_helper_mac.mm
+index e3a170652c0fc1e69284d390bcce27451ed978a5..317e6b586456e4682f6d80c7ffff7e6ca487376c 100644
+--- a/content/browser/theme_helper_mac.mm
++++ b/content/browser/theme_helper_mac.mm
+@@ -28,6 +28,20 @@
+ 
+ namespace {
+ 
++// -[NSAppearance performAsCurrentDrawingAppearance:] needs macOS 11. Before
++// that, set the current appearance around the block instead.
++void PerformAsCurrentDrawingAppearance(NSAppearance* appearance,
++                                       void (^block)(void)) {
++  if (@available(macOS 11.0, *)) {
++    [appearance performAsCurrentDrawingAppearance:block];
++    return;
++  }
++  NSAppearance* saved_appearance = NSAppearance.currentAppearance;
++  NSAppearance.currentAppearance = appearance;
++  block();
++  NSAppearance.currentAppearance = saved_appearance;
++}
++
+ void FillScrollbarThemeParams(
+     content::mojom::UpdateScrollbarThemeParams* params) {
+   DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+@@ -314,14 +328,22 @@ - (void)notifyPrefsChangedWithRedraw:(BOOL)redraw {
+         break;
+       }
+       case blink::MacSystemColorID::kControlAccentColor:
+-        values[i] = NSColorToSkColor(NSColor.controlAccentColor);
++        if (@available(macOS 10.14, *)) {
++          values[i] = NSColorToSkColor(NSColor.controlAccentColor);
++        } else {
++          values[i] = NSColorToSkColor(NSColor.alternateSelectedControlColor);
++        }
+         break;
+       case blink::MacSystemColorID::kKeyboardFocusIndicator:
+         values[i] = NSColorToSkColor(NSColor.keyboardFocusIndicatorColor);
+         break;
+       case blink::MacSystemColorID::kSecondarySelectedControl:
+-        values[i] = NSColorToSkColor(
+-            NSColor.unemphasizedSelectedContentBackgroundColor);
++        if (@available(macOS 10.14, *)) {
++          values[i] = NSColorToSkColor(
++              NSColor.unemphasizedSelectedContentBackgroundColor);
++        } else {
++          values[i] = NSColorToSkColor(NSColor.secondarySelectedControlColor);
++        }
+         break;
+       case blink::MacSystemColorID::kSelectedTextBackground:
+         values[i] = NSColorToSkColor(NSColor.selectedTextBackgroundColor);
+@@ -338,17 +360,23 @@ - (void)notifyPrefsChangedWithRedraw:(BOOL)redraw {
+   base::span<SkColor> values = writable_color_map_.GetMemoryAsSpan<SkColor>(
+       blink::kMacSystemColorIDCount * blink::kMacSystemColorSchemeCount);
+ 
+-  [[NSAppearance appearanceNamed:NSAppearanceNameAqua]
+-      performAsCurrentDrawingAppearance:^{
++  // There is no dark appearance before macOS 10.14, so both color schemes
++  // get the light colors there.
++  NSAppearance* dark_appearance =
++      [NSAppearance appearanceNamed:NSAppearanceNameAqua];
++  if (@available(macOS 10.14, *)) {
++    dark_appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
++  }
++  PerformAsCurrentDrawingAppearance(
++      [NSAppearance appearanceNamed:NSAppearanceNameAqua], ^{
+         LoadSystemColorsForCurrentAppearance(
+             values.first<blink::kMacSystemColorIDCount>());
+-      }];
+-  [[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]
+-      performAsCurrentDrawingAppearance:^{
+-        LoadSystemColorsForCurrentAppearance(
+-            values.subspan<blink::kMacSystemColorIDCount,
+-                           blink::kMacSystemColorIDCount>());
+-      }];
++      });
++  PerformAsCurrentDrawingAppearance(dark_appearance, ^{
++    LoadSystemColorsForCurrentAppearance(
++        values.subspan<blink::kMacSystemColorIDCount,
++                       blink::kMacSystemColorIDCount>());
++  });
+ }
+ 
+ void ThemeHelperMac::OnRenderProcessHostCreated(
+diff --git a/content/browser/web_contents/web_drag_dest_mac.mm b/content/browser/web_contents/web_drag_dest_mac.mm
+index 56e65e7e79d889c93148e5407f307aa976b9fd6a..84f31a053a60b8b2828ea782996cfdebc535af81 100644
+--- a/content/browser/web_contents/web_drag_dest_mac.mm
++++ b/content/browser/web_contents/web_drag_dest_mac.mm
+@@ -18,6 +18,7 @@
+ #include "base/containers/to_vector.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/callback_helpers.h"
++#include "base/mac/uttype_compat.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "components/input/render_widget_host_input_event_router.h"
+@@ -841,8 +842,7 @@ DropData PopulateDropDataFromPasteboard(NSPasteboard* pboard) {
+   // scavenge any generic images that might be present.
+   if (file_data.length == 0 && drop_data.filenames.empty()) {
+     for (NSString* type in types) {
+-      UTType* utType = [UTType typeWithIdentifier:type];
+-      if (utType && [utType conformsToType:UTTypeImage]) {
++      if (base::mac::UTTypeConformsTo(type, @"public.image")) {
+         NSData* data = [pboard dataForType:type];
+         if (data) {
+           file_data = data;
+@@ -859,10 +859,10 @@ DropData PopulateDropDataFromPasteboard(NSPasteboard* pboard) {
+         base::ToVector(base::apple::NSDataToSpan(file_data));
+ 
+     if (content_type_id) {
+-      UTType* utType = [UTType typeWithIdentifier:content_type_id];
+-      if (utType && utType.preferredFilenameExtension) {
++      if (NSString* extension =
++              base::mac::UTTypePreferredFilenameExtension(content_type_id)) {
+         drop_data.file_contents_filename_extension =
+-            base::SysNSStringToUTF8(utType.preferredFilenameExtension);
++            base::SysNSStringToUTF8(extension);
+       }
+     }
+ 
 diff --git a/crypto/apple/unexportable_key_apple.mm b/crypto/apple/unexportable_key_apple.mm
 index 365706f7b536c59f65be3272c79f428bdc5941c1..95d735f8477dff520baf925049b3de4320bf9038 100644
 --- a/crypto/apple/unexportable_key_apple.mm
@@ -559,6 +1808,175 @@ index e686813116bc5351da4b23bce043c8c78e1f87d5..37d58a8cfc964293576f6a8e3e24eb12
        iterator.InitializeInto());
    if (result != kIOReturnSuccess) {
      BLUETOOTH_LOG(ERROR) << "Failed to enumerate Bluetooth controller: "
+diff --git a/device/bluetooth/bluetooth_adapter_mac_permission.mm b/device/bluetooth/bluetooth_adapter_mac_permission.mm
+index fa4d4ac84bc2b3a8696abd66be19310341ee0bfd..4a059c5c261b2430de7ccfd85703de3ba79a1b99 100644
+--- a/device/bluetooth/bluetooth_adapter_mac_permission.mm
++++ b/device/bluetooth/bluetooth_adapter_mac_permission.mm
+@@ -9,6 +9,13 @@
+ namespace device {
+ 
+ BluetoothAdapter::PermissionStatus GetMacBluetoothPermissionStatus() {
++  // There is no Bluetooth permission before macOS 10.15.
++  if (@available(macOS 10.15, *)) {
++  } else {
++    return BluetoothAdapter::PermissionStatus::kAllowed;
++  }
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+   switch (CBCentralManager.authorization) {
+     case CBManagerAuthorizationNotDetermined:
+       return BluetoothAdapter::PermissionStatus::kUndetermined;
+@@ -18,6 +25,7 @@
+     case CBManagerAuthorizationAllowedAlways:
+       return BluetoothAdapter::PermissionStatus::kAllowed;
+   }
++#pragma clang diagnostic pop
+ }
+ 
+ }  // namespace device
+diff --git a/device/gamepad/game_controller_data_fetcher_mac.mm b/device/gamepad/game_controller_data_fetcher_mac.mm
+index 9a5827c537740cb5b0aea4296531a142bd4b7ea8..0ba6e32b8055651b8455c81f686fc69fbeb0b120 100644
+--- a/device/gamepad/game_controller_data_fetcher_mac.mm
++++ b/device/gamepad/game_controller_data_fetcher_mac.mm
+@@ -133,7 +133,10 @@ GameControllerMacOutcome GetSupportOutcome(GCController* controller) {
+   // applications to detect the new devices. These gamepads are already
+   // supported in Chrome through other data fetchers and must be blocked here to
+   // avoid double-enumeration.
+-  NSString* product_category = controller.productCategory;
++  NSString* product_category = nil;
++  if (@available(macOS 10.15, *)) {
++    product_category = controller.productCategory;
++  }
+   if ([product_category isEqualToString:@"Switch Pro Controller"] ||
+       [product_category isEqualToString:@"Nintendo Switch JoyCon (L/R)"]) {
+     return GameControllerMacOutcome::kIsNintendoGamepad;
+@@ -159,6 +162,19 @@ GameControllerMacOutcome GetSupportOutcome(GCController* controller) {
+   return GameControllerMacOutcome::kSuccess;
+ }
+ 
++// GameControllerGamepad uses GameController and CoreHaptics APIs from macOS
++// 10.14.1 through 11 without checking their availability, so only use it on
++// macOS 11 and later.
++bool UseGameControllerGamepads() {
++  if (@available(macOS 11.0, *)) {
++    return base::FeatureList::IsEnabled(
++               features::kXboxUseGameControllerDataFetcherMac) ||
++           base::FeatureList::IsEnabled(
++               features::kPlayStationUseGameControllerDataFetcherMac);
++  }
++  return false;
++}
++
+ }  // namespace
+ 
+ void GameControllerDataFetcherMac::GameControllerDataFetcherMacImpl::
+@@ -276,10 +292,7 @@ GameControllerMacOutcome GetSupportOutcome(GCController* controller) {
+       main_task_runner_(base::SingleThreadTaskRunner::GetCurrentDefault()) {}
+ 
+ GameControllerDataFetcherMac::~GameControllerDataFetcherMac() {
+-  if (base::FeatureList::IsEnabled(
+-          features::kXboxUseGameControllerDataFetcherMac) ||
+-      base::FeatureList::IsEnabled(
+-          features::kPlayStationUseGameControllerDataFetcherMac)) {
++  if (UseGameControllerGamepads()) {
+     GameControllerNotificationHandler* handler = impl_->notification_handler_;
+     impl_->notification_handler_ = nil;
+     main_task_runner_->PostTask(
+@@ -297,10 +310,7 @@ GameControllerMacOutcome GetSupportOutcome(GCController* controller) {
+ }
+ 
+ void GameControllerDataFetcherMac::OnAddedToProvider() {
+-  if (base::FeatureList::IsEnabled(
+-          features::kXboxUseGameControllerDataFetcherMac) ||
+-      base::FeatureList::IsEnabled(
+-          features::kPlayStationUseGameControllerDataFetcherMac)) {
++  if (UseGameControllerGamepads()) {
+     polling_task_runner_ = base::SingleThreadTaskRunner::GetCurrentDefault();
+     main_task_runner_->PostTask(
+         FROM_HERE,
+@@ -315,10 +325,7 @@ GameControllerMacOutcome GetSupportOutcome(GCController* controller) {
+ }
+ 
+ void GameControllerDataFetcherMac::GetGamepadData(bool) {
+-  if (base::FeatureList::IsEnabled(
+-          features::kXboxUseGameControllerDataFetcherMac) ||
+-      base::FeatureList::IsEnabled(
+-          features::kPlayStationUseGameControllerDataFetcherMac)) {
++  if (UseGameControllerGamepads()) {
+     for (const auto& entry : impl_->gamepads_) {
+       const int source_id = entry.first;
+ 
+@@ -454,10 +461,7 @@ GameControllerMacOutcome GetSupportOutcome(GCController* controller) {
+     mojom::GamepadEffectParametersPtr params,
+     mojom::GamepadHapticsManager::PlayVibrationEffectOnceCallback callback,
+     scoped_refptr<base::SequencedTaskRunner> callback_runner) {
+-  if (!base::FeatureList::IsEnabled(
+-          features::kXboxUseGameControllerDataFetcherMac) &&
+-      !base::FeatureList::IsEnabled(
+-          features::kPlayStationUseGameControllerDataFetcherMac)) {
++  if (!UseGameControllerGamepads()) {
+     RunVibrationCallback(
+         std::move(callback), std::move(callback_runner),
+         mojom::GamepadHapticsResult::GamepadHapticsResultNotSupported);
+@@ -478,10 +482,7 @@ GameControllerMacOutcome GetSupportOutcome(GCController* controller) {
+     int source_id,
+     mojom::GamepadHapticsManager::ResetVibrationActuatorCallback callback,
+     scoped_refptr<base::SequencedTaskRunner> callback_runner) {
+-  if (!base::FeatureList::IsEnabled(
+-          features::kXboxUseGameControllerDataFetcherMac) &&
+-      !base::FeatureList::IsEnabled(
+-          features::kPlayStationUseGameControllerDataFetcherMac)) {
++  if (!UseGameControllerGamepads()) {
+     RunVibrationCallback(
+         std::move(callback), std::move(callback_runner),
+         mojom::GamepadHapticsResult::GamepadHapticsResultNotSupported);
+diff --git a/device/gamepad/game_controller_gamepad.h b/device/gamepad/game_controller_gamepad.h
+index 99d2b337a3cb3a7a95f60708d501260d4455c3f0..2cd404ebb3d75716b6bd08e943b79306c1ea545a 100644
+--- a/device/gamepad/game_controller_gamepad.h
++++ b/device/gamepad/game_controller_gamepad.h
+@@ -15,6 +15,12 @@
+ #include "device/gamepad/gamepad_export.h"
+ #include "device/gamepad/public/cpp/gamepad.h"
+ 
++// GameControllerGamepad uses GameController and CoreHaptics APIs from macOS
++// 10.14.1 through 11. GameControllerDataFetcherMac only creates it on macOS 11
++// and later, so the uses here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace device {
+ 
+ class DEVICE_GAMEPAD_EXPORT GameControllerGamepad
+@@ -71,4 +77,6 @@ class DEVICE_GAMEPAD_EXPORT GameControllerGamepad
+ 
+ }  // namespace device
+ 
++#pragma clang diagnostic pop
++
+ #endif  // DEVICE_GAMEPAD_GAME_CONTROLLER_GAMEPAD_H_
+diff --git a/device/gamepad/game_controller_gamepad.mm b/device/gamepad/game_controller_gamepad.mm
+index 66199ee4ea38aa9fdea37758e632ce00637a9837..4ab935078419cfe277fee74d5f0b2b308402a3dc 100644
+--- a/device/gamepad/game_controller_gamepad.mm
++++ b/device/gamepad/game_controller_gamepad.mm
+@@ -15,6 +15,12 @@
+ #include "base/strings/sys_string_conversions.h"
+ #include "device/gamepad/gamepad_standard_mappings.h"
+ 
++// GameControllerGamepad uses GameController and CoreHaptics APIs from macOS
++// 10.14.1 through 11. GameControllerDataFetcherMac only creates it on macOS 11
++// and later, so the uses here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace device {
+ 
+ namespace {
+@@ -500,3 +506,5 @@ void SetOptionalButton(Gamepad& pad,
+ }
+ 
+ }  // namespace device
++
++#pragma clang diagnostic pop
 diff --git a/device/gamepad/xbox_data_fetcher_mac.cc b/device/gamepad/xbox_data_fetcher_mac.cc
 index b194fc23e1baacd7e9cbae5eb5b785b45c7803ca..0643c742527fe3af323e0d58000fbcb7de88427e 100644
 --- a/device/gamepad/xbox_data_fetcher_mac.cc
@@ -572,6 +1990,340 @@ index b194fc23e1baacd7e9cbae5eb5b785b45c7803ca..0643c742527fe3af323e0d58000fbcb7
    if (!port_.is_valid())
      return false;
    source_ = IONotificationPortGetRunLoopSource(port_.get());
+diff --git a/gpu/command_buffer/service/shared_image/iosurface_image_backing.h b/gpu/command_buffer/service/shared_image/iosurface_image_backing.h
+index 166f980451844777116e36eaf7fb71bbd727c723..8042720eb706f625460b7a26490e555a5d7166de 100644
+--- a/gpu/command_buffer/service/shared_image/iosurface_image_backing.h
++++ b/gpu/command_buffer/service/shared_image/iosurface_image_backing.h
+@@ -23,6 +23,12 @@
+ 
+ @protocol MTLDevice;
+ 
++// MTLSharedEvent needs macOS 10.14. Shared events only come from ANGLE's
++// Metal backend or Dawn, which are not used on older releases, so the uses
++// here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace gl {
+ class GLFenceEGL;
+ class ScopedEGLSurfaceIOSurface;
+@@ -357,4 +363,6 @@ class GPU_GLES2_EXPORT IOSurfaceImageBacking
+ 
+ }  // namespace gpu
+ 
++#pragma clang diagnostic pop
++
+ #endif  // GPU_COMMAND_BUFFER_SERVICE_SHARED_IMAGE_IOSURFACE_IMAGE_BACKING_H_
+diff --git a/gpu/command_buffer/service/shared_image/iosurface_image_backing.mm b/gpu/command_buffer/service/shared_image/iosurface_image_backing.mm
+index 1bd0dd9f975d94f752a9d32a810e03054493933b..465ff1e1cbbca5eb64da2348a69e68ff192e1a32 100644
+--- a/gpu/command_buffer/service/shared_image/iosurface_image_backing.mm
++++ b/gpu/command_buffer/service/shared_image/iosurface_image_backing.mm
+@@ -53,6 +53,12 @@
+ #include "ui/gl/scoped_make_current.h"
+ #include "ui/gl/scoped_restore_texture.h"
+ 
++// MTLSharedEvent needs macOS 10.14. Shared events only come from ANGLE's
++// Metal backend or Dawn, which are not used on older releases, so the uses
++// here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace gpu {
+ 
+ namespace {
+@@ -1975,3 +1981,5 @@ ScopedIOSurfaceLock io_surface_lock(io_surface_.get(),
+ }
+ 
+ }  // namespace gpu
++
++#pragma clang diagnostic pop
+diff --git a/media/audio/mac/audio_loopback_input_mac_impl.mm b/media/audio/mac/audio_loopback_input_mac_impl.mm
+index 2f70d2c6ce793c97cc131fb8c3d9875e42f840a1..da40f6fde35d38c38ca306e414db6e3e1e1de228 100644
+--- a/media/audio/mac/audio_loopback_input_mac_impl.mm
++++ b/media/audio/mac/audio_loopback_input_mac_impl.mm
+@@ -24,6 +24,12 @@
+     void(base::apple::ScopedCFTypeRef<CMSampleBufferRef>, const double)>;
+ using ErrorCallback = base::RepeatingCallback<void()>;
+ 
++// ScreenCaptureKit audio capture needs macOS 13. AudioManagerMac only
++// creates these streams on macOS 13 and later, so availability is not
++// checked again for each use.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace media {
+ 
+ using Error = AudioInputStream::AudioInputCallback::Error;
+@@ -573,3 +579,5 @@ - (void)stream:(SCStream*)stream
+ }
+ 
+ }  // namespace media
++
++#pragma clang diagnostic pop
+diff --git a/media/audio/mac/audio_manager_mac.cc b/media/audio/mac/audio_manager_mac.cc
+index fff88523dafbdaad4116d10cf03f31ff30f8fdc7..3a6f3ceeadf2b83b54667e601ff3c13dfb5b54ef 100644
+--- a/media/audio/mac/audio_manager_mac.cc
++++ b/media/audio/mac/audio_manager_mac.cc
+@@ -897,7 +897,14 @@ AudioOutputStream* AudioManagerMac::MakeLowLatencyOutputStream(
+ 
+   // Use AVFoundationOutputStream for kPlayback audio output streams as it is
+   // able to tell the OS to use Spatial Audio.
+-  if (base::FeatureList::IsEnabled(features::kMacAVFoundationPlayback) &&
++  // AVFoundationOutputStream uses AVSampleBufferRenderSynchronizer APIs from
++  // macOS 10.14.
++  bool av_foundation_output_supported = false;
++  if (__builtin_available(macOS 10.14, *)) {
++    av_foundation_output_supported = true;
++  }
++  if (av_foundation_output_supported &&
++      base::FeatureList::IsEnabled(features::kMacAVFoundationPlayback) &&
+       params.latency_tag() == AudioLatency::Type::kPlayback) {
+     DVLOG(1) << __func__ << ": Creating AVFoundationOutputStream for "
+              << ChannelLayoutToString(params.channel_layout()) << " layout.";
+@@ -953,11 +960,15 @@ AudioInputStream* AudioManagerMac::MakeLowLatencyInputStream(
+                          base::Unretained(this)));
+     }
+ 
+-    screen_capture_kit_swizzler_ = SwizzleScreenCaptureKit();
+-    return CreateSCKAudioInputStream(
+-        params, device_id, log_callback,
+-        base::BindRepeating(&AudioManagerBase::ReleaseInputStream,
+-                            base::Unretained(this)));
++    // ScreenCaptureKit audio capture needs macOS 13.
++    if (__builtin_available(macOS 13.0, *)) {
++      screen_capture_kit_swizzler_ = SwizzleScreenCaptureKit();
++      return CreateSCKAudioInputStream(
++          params, device_id, log_callback,
++          base::BindRepeating(&AudioManagerBase::ReleaseInputStream,
++                              base::Unretained(this)));
++    }
++    return nullptr;
+   }
+ 
+   // Gets the AudioDeviceID that refers to the AudioInputDevice with the device
+diff --git a/media/audio/mac/avfoundation_output_stream.mm b/media/audio/mac/avfoundation_output_stream.mm
+index 77b9761cd9a54546e957a0d4cbb065d4637a16c3..41b7a73e5f3c1c5c5dfe6c15c39d7683e0854b7e 100644
+--- a/media/audio/mac/avfoundation_output_stream.mm
++++ b/media/audio/mac/avfoundation_output_stream.mm
+@@ -21,6 +21,11 @@
+ #include "media/base/mac/channel_layout_util_mac.h"
+ #include "media/base/sample_format.h"
+ 
++// AVFoundationOutputStream uses AVSampleBufferRenderSynchronizer APIs from
++// macOS 10.14. AudioManagerMac only creates it on macOS 10.14 and later.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace media {
+ 
+ namespace {
+@@ -304,3 +309,5 @@
+ }
+ 
+ }  // namespace media
++
++#pragma clang diagnostic pop
+diff --git a/media/base/mac/color_space_util_mac.mm b/media/base/mac/color_space_util_mac.mm
+index a93e246d61ceed8f0e0b329a7e34e44053281c84..32de6eaff28108c52b22445b381f8a14e2edfc38 100644
+--- a/media/base/mac/color_space_util_mac.mm
++++ b/media/base/mac/color_space_util_mac.mm
+@@ -18,17 +18,33 @@
+ 
+ namespace media {
+ 
++namespace {
++
++// CVBufferCopyAttachment() needs macOS 12. Before that, retain the result of
++// CVBufferGetAttachment(), which it replaced.
++CFTypeRef CopyAttachment(CVBufferRef buffer, CFStringRef key) {
++  if (@available(macOS 12.0, *)) {
++    return CVBufferCopyAttachment(buffer, key, /*attachmentMode=*/nullptr);
++  }
++  CFTypeRef value = CVBufferGetAttachment(buffer, key,
++                                          /*attachmentMode=*/nullptr);
++  if (value) {
++    CFRetain(value);
++  }
++  return value;
++}
++
++}  // namespace
++
+ gfx::ColorSpace GetImageBufferColorSpace(CVImageBufferRef image_buffer) {
+   base::apple::ScopedCFTypeRef<CFTypeRef> color_primaries(
+-      CVBufferCopyAttachment(image_buffer, kCVImageBufferColorPrimariesKey,
+-                             /*attachmentMode=*/nullptr));
++      CopyAttachment(image_buffer, kCVImageBufferColorPrimariesKey));
+   base::apple::ScopedCFTypeRef<CFTypeRef> transfer_function(
+-      CVBufferCopyAttachment(image_buffer, kCVImageBufferTransferFunctionKey,
+-                             /*attachmentMode=*/nullptr));
+-  base::apple::ScopedCFTypeRef<CFTypeRef> gamma_level(CVBufferCopyAttachment(
+-      image_buffer, kCVImageBufferGammaLevelKey, /*attachmentMode=*/nullptr));
+-  base::apple::ScopedCFTypeRef<CFTypeRef> ycbcr_matrix(CVBufferCopyAttachment(
+-      image_buffer, kCVImageBufferYCbCrMatrixKey, /*attachmentMode=*/nullptr));
++      CopyAttachment(image_buffer, kCVImageBufferTransferFunctionKey));
++  base::apple::ScopedCFTypeRef<CFTypeRef> gamma_level(
++      CopyAttachment(image_buffer, kCVImageBufferGammaLevelKey));
++  base::apple::ScopedCFTypeRef<CFTypeRef> ycbcr_matrix(
++      CopyAttachment(image_buffer, kCVImageBufferYCbCrMatrixKey));
+ 
+   return gfx::ColorSpaceFromCVImageBufferKeys(
+       color_primaries.get(), transfer_function.get(), gamma_level.get(),
+diff --git a/media/base/mac/video_capture_device_avfoundation_helpers.mm b/media/base/mac/video_capture_device_avfoundation_helpers.mm
+index 613f7c23946b2e84bfbc5e3952c2348f6a5b1fa5..e27ee4597defd1fc41f99059a2dd3961586d86bf 100644
+--- a/media/base/mac/video_capture_device_avfoundation_helpers.mm
++++ b/media/base/mac/video_capture_device_avfoundation_helpers.mm
+@@ -16,7 +16,22 @@
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ #endif  // BUILDFLAG(IS_MAC)
+ 
++static NSArray<AVCaptureDevice*>* GetVideoCaptureDevicesWithDiscoverySession()
++    API_AVAILABLE(macos(10.15));
++
+ NSArray<AVCaptureDevice*>* GetVideoCaptureDevices() {
++#if BUILDFLAG(IS_MAC)
++  // AVCaptureDeviceDiscoverySession needs macOS 10.15.
++  if (@available(macOS 10.15, *)) {
++    return GetVideoCaptureDevicesWithDiscoverySession();
++  }
++  return [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
++#else
++  return GetVideoCaptureDevicesWithDiscoverySession();
++#endif
++}
++
++static NSArray<AVCaptureDevice*>* GetVideoCaptureDevicesWithDiscoverySession() {
+   // Camera device types available on all apple platforms.
+   NSArray* captureDeviceTypes = @[ AVCaptureDeviceTypeBuiltInWideAngleCamera ];
+ 
+diff --git a/media/base/mac/video_frame_mac.mm b/media/base/mac/video_frame_mac.mm
+index 958e97aa94fdcdbde628e5dc1f10a4c968097cc8..1d235c2175c62c7b2243cfe2759b79eae59e84f8 100644
+--- a/media/base/mac/video_frame_mac.mm
++++ b/media/base/mac/video_frame_mac.mm
+@@ -55,10 +55,20 @@ bool IsAcceptableCvPixelFormat(VideoPixelFormat format, OSType cv_format) {
+ }
+ 
+ bool CvPixelBufferHasColorSpace(CVPixelBufferRef pixel_buffer) {
+-  return CVBufferHasAttachment(pixel_buffer, kCVImageBufferColorPrimariesKey) &&
+-         CVBufferHasAttachment(pixel_buffer,
+-                               kCVImageBufferTransferFunctionKey) &&
+-         CVBufferHasAttachment(pixel_buffer, kCVImageBufferYCbCrMatrixKey);
++  if (@available(macOS 12.0, *)) {
++    return CVBufferHasAttachment(pixel_buffer,
++                                 kCVImageBufferColorPrimariesKey) &&
++           CVBufferHasAttachment(pixel_buffer,
++                                 kCVImageBufferTransferFunctionKey) &&
++           CVBufferHasAttachment(pixel_buffer, kCVImageBufferYCbCrMatrixKey);
++  }
++  // CVBufferHasAttachment() needs macOS 12.
++  return CVBufferGetAttachment(pixel_buffer, kCVImageBufferColorPrimariesKey,
++                               nullptr) &&
++         CVBufferGetAttachment(pixel_buffer, kCVImageBufferTransferFunctionKey,
++                               nullptr) &&
++         CVBufferGetAttachment(pixel_buffer, kCVImageBufferYCbCrMatrixKey,
++                               nullptr);
+ }
+ 
+ void SetCvPixelBufferColorSpace(const gfx::ColorSpace& frame_cs,
+diff --git a/media/capture/video/apple/video_capture_device_avfoundation.mm b/media/capture/video/apple/video_capture_device_avfoundation.mm
+index 8a0ef2fff6b3e4174b85746e5dcb44b428cd9937..fda925b130b8ed064b06bcc5f68da3eea8a6d48a 100644
+--- a/media/capture/video/apple/video_capture_device_avfoundation.mm
++++ b/media/capture/video/apple/video_capture_device_avfoundation.mm
+@@ -263,7 +263,8 @@ @implementation VideoCaptureDeviceAVFoundation {
+   // in case the color space cannot be correclty determined from the buffer.
+   std::optional<gfx::ColorSpace> _colorSpaceAfterTransform;
+ 
+-  AVCapturePhotoOutput* __strong _photoOutput;
++  // An AVCapturePhotoOutput, which needs macOS 10.15.
++  AVCaptureOutput* __strong _photoOutput;
+ 
+   // Only accessed on the main thread. The takePhoto() operation is considered
+   // pending until we're ready to take another photo, which involves a PostTask
+@@ -620,6 +621,16 @@ - (void)takePhoto {
+   DCHECK(_mainThreadTaskRunner->BelongsToCurrentThread());
+   DCHECK(_captureSession.running);
+ 
++  // AVCapturePhotoOutput needs macOS 10.15.
++  if (@available(macOS 10.15, *)) {
++  } else {
++    base::AutoLock lock(_lock);
++    if (_frameReceiver) {
++      _frameReceiver->OnPhotoError();
++    }
++    return;
++  }
++
+   ++_pendingTakePhotos;
+   if (_pendingTakePhotos > 1u) {
+     // There is already pending takePhoto(). When it finishes it will kick off
+@@ -641,7 +652,9 @@ - (void)takePhoto {
+   {
+     // `_lock` is needed since `_photoOutput` may be read from non-main thread.
+     base::AutoLock lock(_lock);
+-    _photoOutput = [[AVCapturePhotoOutput alloc] init];
++    if (@available(macOS 10.15, *)) {
++      _photoOutput = [[AVCapturePhotoOutput alloc] init];
++    }
+   }
+   if (![_captureSession canAddOutput:_photoOutput]) {
+     {
+@@ -689,12 +702,14 @@ - (void)takePhotoInternal {
+     // Asynchronous success or failure is handled inside
+     // captureOutput:didFinishProcessingPhoto:error on an unknown thread.
+     // Synchronous failures are handled in the catch clause below.
+-    [_photoOutput
+-        capturePhotoWithSettings:[AVCapturePhotoSettings
+-                                     photoSettingsWithFormat:@{
+-                                       AVVideoCodecKey : AVVideoCodecTypeJPEG
+-                                     }]
+-                        delegate:self];
++    if (@available(macOS 10.15, *)) {
++      [(AVCapturePhotoOutput*)_photoOutput
++          capturePhotoWithSettings:[AVCapturePhotoSettings
++                                       photoSettingsWithFormat:@{
++                                         AVVideoCodecKey : AVVideoCodecTypeJPEG
++                                       }]
++                          delegate:self];
++    }
+   } @catch (id exception) {
+     {
+       base::AutoLock lock(_lock);
+@@ -720,7 +735,10 @@ - (void)captureOutput:(id)output        // AVCapturePhotoOutput*
+   if (_frameReceiver) {
+     // Always non-nil according to Apple's documentation.
+     DCHECK(photo);
+-    NSData* data = static_cast<AVCapturePhoto*>(photo).fileDataRepresentation;
++    NSData* data = nil;
++    if (@available(macOS 10.15, *)) {
++      data = static_cast<AVCapturePhoto*>(photo).fileDataRepresentation;
++    }
+     if (!error && data) {
+       _frameReceiver->OnPhotoTaken(reinterpret_cast<const uint8_t*>(data.bytes),
+                                    data.length, "image/jpeg");
+@@ -1250,7 +1268,10 @@ - (bool)isPortraitEffectSupported {
+   if (_isPortraitEffectSupportedForTesting.has_value()) {
+     return _isPortraitEffectSupportedForTesting.value();
+   }
+-  return _captureDevice.activeFormat.portraitEffectSupported;
++  if (@available(macOS 12.0, *)) {
++    return _captureDevice.activeFormat.portraitEffectSupported;
++  }
++  return false;
+ }
+ 
+ - (void)setIsPortraitEffectActiveForTesting:
+@@ -1271,7 +1292,10 @@ - (bool)isPortraitEffectActive {
+   if (_isPortraitEffectActiveForTesting.has_value()) {
+     return _isPortraitEffectActiveForTesting.value();
+   }
+-  return _captureDevice.portraitEffectActive;
++  if (@available(macOS 12.0, *)) {
++    return _captureDevice.portraitEffectActive;
++  }
++  return false;
+ }
+ 
+ - (void)observeValueForKeyPath:(NSString*)keyPath
 diff --git a/media/capture/video/mac/uvc_control_mac.mm b/media/capture/video/mac/uvc_control_mac.mm
 index 5288759851246eafd815f843da82506f04db2821..43c2915622665040832cb2d2c3c4850c5bf58925 100644
 --- a/media/capture/video/mac/uvc_control_mac.mm
@@ -585,6 +2337,148 @@ index 5288759851246eafd815f843da82506f04db2821..43c2915622665040832cb2d2c3c4850c
    if (kr != kIOReturnSuccess) {
      VLOG(1) << "No devices found with specified Vendor and Product ID.";
      return false;
+diff --git a/media/gpu/mac/video_toolbox_video_decoder.cc b/media/gpu/mac/video_toolbox_video_decoder.cc
+index b74a725bc29053139a8053f284a58cde30c63cb6..5fec5a82cecdf04020ce9944702b1343acbbed5b 100644
+--- a/media/gpu/mac/video_toolbox_video_decoder.cc
++++ b/media/gpu/mac/video_toolbox_video_decoder.cc
+@@ -47,8 +47,12 @@ bool SupportsH264() {
+ 
+ bool InitializeVP9() {
+ #if BUILDFLAG(IS_MAC)
+-  VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+-  return VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9);
++  // VTRegisterSupplementalVideoDecoderIfAvailable() needs macOS 11.
++  if (__builtin_available(macOS 11.0, *)) {
++    VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
++    return VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9);
++  }
++  return false;
+ #else
+   // TODO(crbug.com/40269929): Enable VP9 on iOS.
+   return false;
+diff --git a/media/gpu/mac/vt_config_util.mm b/media/gpu/mac/vt_config_util.mm
+index b64df4cd8b6dee4e8195b6511ee540f757d68522..32a81a5af674760a1770f1fad18a68d09d7f47c2 100644
+--- a/media/gpu/mac/vt_config_util.mm
++++ b/media/gpu/mac/vt_config_util.mm
+@@ -73,7 +73,11 @@ CFStringRef GetTransferFunction(
+     media::VideoColorSpace::TransferID transfer_id) {
+   switch (transfer_id) {
+     case media::VideoColorSpace::TransferID::LINEAR:
+-      return kCMFormatDescriptionTransferFunction_Linear;
++      if (@available(macOS 10.14, *)) {
++        return kCMFormatDescriptionTransferFunction_Linear;
++      }
++      DLOG(ERROR) << "Linear transfer function needs macOS 10.14";
++      return nil;
+ 
+     case media::VideoColorSpace::TransferID::GAMMA22:
+     case media::VideoColorSpace::TransferID::GAMMA28:
+diff --git a/media/gpu/mac/vt_video_encode_accelerator_mac.mm b/media/gpu/mac/vt_video_encode_accelerator_mac.mm
+index 5c7a54fd98b5090bacb3b91fc2b2194f05e0b2eb..70cde342f4d5cdd24f2d84deb26d39c76fdf1ede 100644
+--- a/media/gpu/mac/vt_video_encode_accelerator_mac.mm
++++ b/media/gpu/mac/vt_video_encode_accelerator_mac.mm
+@@ -151,6 +151,11 @@
+ }
+ 
+ bool IsSVCSupported(VideoCodec codec) {
++  // SVC and per-frame QP need VideoToolbox APIs from macOS 11.3 and 12.
++  if (@available(macOS 12.0, iOS 15.0, *)) {
++  } else {
++    return false;
++  }
+ #if BUILDFLAG(ENABLE_HEVC_PARSER_AND_HW_DECODER) && defined(ARCH_CPU_ARM_FAMILY)
+   // macOS 14.0+ support SVC HEVC encoding for Apple Silicon chips only.
+   if (codec == VideoCodec::kHEVC) {
+@@ -278,8 +283,10 @@ bool IsHardwareEncoder(VTSessionRef compression_session) {
+   // encoder leads to an initialization error.
+   if (required_encoder_type != EncoderType::kSoftware && require_low_delay &&
+       IsSVCSupported(codec)) {
+-    encoder_spec[CFToNSPtrCast(
+-        kVTVideoEncoderSpecification_EnableLowLatencyRateControl)] = @YES;
++    if (@available(macOS 11.3, iOS 14.5, *)) {
++      encoder_spec[CFToNSPtrCast(
++          kVTVideoEncoderSpecification_EnableLowLatencyRateControl)] = @YES;
++    }
+   }
+ 
+   // Create the compression session.
+@@ -679,8 +686,10 @@ VideoEncoderInfo GetVideoEncoderInfo(
+       options.quantizer.has_value()) {
+     DCHECK(require_low_delay_);
+     frame_qp = std::clamp(options.quantizer.value(), 1, kH26xMaxQp);
+-    frame_props[CFToNSPtrCast(kVTEncodeFrameOptionKey_BaseFrameQP)] =
+-        @(frame_qp.value());
++    if (@available(macOS 12.0, iOS 15.0, *)) {
++      frame_props[CFToNSPtrCast(kVTEncodeFrameOptionKey_BaseFrameQP)] =
++          @(frame_qp.value());
++    }
+   }
+ 
+   // VideoToolbox uses timestamps for rate control purposes, but we can't rely
+@@ -1148,17 +1157,20 @@ BitstreamBufferMetadata md(used_buffer_size, keyframe,
+     return false;
+   }
+ 
+-  if (!session_property_setter.IsSupported(
+-          kVTCompressionPropertyKey_BaseLayerFrameRateFraction)) {
+-    NotifyErrorStatus({EncoderStatus::Codes::kEncoderUnsupportedConfig,
+-                       "BaseLayerFrameRateFraction is not supported"});
+-    return false;
+-  }
+-  if (!session_property_setter.Set(
+-          kVTCompressionPropertyKey_BaseLayerFrameRateFraction, 0.5)) {
+-    NotifyErrorStatus({EncoderStatus::Codes::kEncoderUnsupportedConfig,
+-                       "Setting BaseLayerFrameRate property failed"});
+-    return false;
++  // IsSVCSupported() checked for macOS 12 above.
++  if (@available(macOS 11.3, iOS 14.5, *)) {
++    if (!session_property_setter.IsSupported(
++            kVTCompressionPropertyKey_BaseLayerFrameRateFraction)) {
++      NotifyErrorStatus({EncoderStatus::Codes::kEncoderUnsupportedConfig,
++                         "BaseLayerFrameRateFraction is not supported"});
++      return false;
++    }
++    if (!session_property_setter.Set(
++            kVTCompressionPropertyKey_BaseLayerFrameRateFraction, 0.5)) {
++      NotifyErrorStatus({EncoderStatus::Codes::kEncoderUnsupportedConfig,
++                         "Setting BaseLayerFrameRate property failed"});
++      return false;
++    }
+   }
+ 
+   // Configuring the number of reference frames to 1, which will produce
+@@ -1173,16 +1185,22 @@ BitstreamBufferMetadata md(used_buffer_size, keyframe,
+     // see the `unsupported-availability-guard` warning.
+     skip_set_reference_buffer_count = (codec == VideoCodec::kH264);
+   }
+-  if (!skip_set_reference_buffer_count &&
+-      session_property_setter.IsSupported(
+-          kVTCompressionPropertyKey_ReferenceBufferCount)) {
+-    if (!session_property_setter.Set(
+-            kVTCompressionPropertyKey_ReferenceBufferCount, 1)) {
+-      DLOG(WARNING) << "Setting ReferenceBufferCount property failed";
+-    } else {
+-      encoder_produces_svc_spec_compliant_bitstream_ = true;
++  // kVTCompressionPropertyKey_ReferenceBufferCount needs macOS 13.
++  bool reference_buffer_count_supported = false;
++  if (@available(macOS 13.0, iOS 16.0, *)) {
++    if (!skip_set_reference_buffer_count &&
++        session_property_setter.IsSupported(
++            kVTCompressionPropertyKey_ReferenceBufferCount)) {
++      reference_buffer_count_supported = true;
++      if (!session_property_setter.Set(
++              kVTCompressionPropertyKey_ReferenceBufferCount, 1)) {
++        DLOG(WARNING) << "Setting ReferenceBufferCount property failed";
++      } else {
++        encoder_produces_svc_spec_compliant_bitstream_ = true;
++      }
+     }
+-  } else {
++  }
++  if (!reference_buffer_count_supported) {
+     DLOG(WARNING) << "ReferenceBufferCount is not supported";
+   }
+ 
 diff --git a/media/midi/midi_manager_mac.cc b/media/midi/midi_manager_mac.cc
 index a44099cf1dd3fa365f2b9e5a6936df742bd0495b..36ddf45755b70b52c0a067fb586b1e1ed297c25c 100644
 --- a/media/midi/midi_manager_mac.cc
@@ -642,6 +2536,252 @@ index a44099cf1dd3fa365f2b9e5a6936df742bd0495b..36ddf45755b70b52c0a067fb586b1e1e
    } else {
      // Legacy (PacketList) path
      size_t send_size;
+diff --git a/net/base/network_change_notifier_apple.mm b/net/base/network_change_notifier_apple.mm
+index 4594d5f9e08549510c4bc42750b21d9570d74cde..04736291c7b66fea8bb9726b0f1ca5d4f67a45ae 100644
+--- a/net/base/network_change_notifier_apple.mm
++++ b/net/base/network_change_notifier_apple.mm
+@@ -33,6 +33,12 @@
+ #import <CoreTelephony/CTTelephonyNetworkInfo.h>
+ #endif
+ 
++// nw_path_monitor needs macOS 10.14. ShouldUseNetworkPathMonitor() is false
++// before that, so no monitor is created and its uses are not checked
++// individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace net {
+ 
+ struct NetworkChangeNotifierApple::NetworkPathMonitorStorage {
+@@ -562,8 +568,12 @@ static bool CalculateReachability(SCNetworkConnectionFlags flags) {
+ }
+ 
+ bool NetworkChangeNotifierApple::ShouldUseNetworkPathMonitor() const {
+-  return base::FeatureList::IsEnabled(
+-      features::kUseNetworkPathMonitorForNetworkChangeNotifier);
++  // nw_path_monitor needs macOS 10.14. Use SCNetworkReachability before that.
++  if (@available(macOS 10.14, *)) {
++    return base::FeatureList::IsEnabled(
++        features::kUseNetworkPathMonitorForNetworkChangeNotifier);
++  }
++  return false;
+ }
+ 
+ bool NetworkChangeNotifierApple::EnsureNetworkPathMonitorStarted() {
+@@ -718,3 +728,5 @@ static bool CalculateReachability(SCNetworkConnectionFlags flags) {
+ }
+ 
+ }  // namespace net
++
++#pragma clang diagnostic pop
+diff --git a/net/base/platform_mime_util_apple.mm b/net/base/platform_mime_util_apple.mm
+index c65265e929cb5013e9055ef93bcca2c90dc6c13b..64e4ec8a10e294881c87ca7ee22f1dd57c620bfe 100644
+--- a/net/base/platform_mime_util_apple.mm
++++ b/net/base/platform_mime_util_apple.mm
+@@ -32,47 +32,120 @@
+     ext_nodot.erase(ext_nodot.begin());
+   }
+ 
+-  UTType* uttype =
+-      [UTType typeWithFilenameExtension:base::SysUTF8ToNSString(ext_nodot)];
+-  // Dynamic UTTypes are made by the system in the event that there's a
+-  // non-identifiable mime type. For now, we should treat dynamic UTTypes as a
+-  // nonstandard format.
+-  if (uttype.dynamic || uttype.preferredMIMEType == nil) {
++  if (@available(macOS 11, iOS 14, *)) {
++    UTType* uttype =
++        [UTType typeWithFilenameExtension:base::SysUTF8ToNSString(ext_nodot)];
++    // Dynamic UTTypes are made by the system in the event that there's a
++    // non-identifiable mime type. For now, we should treat dynamic UTTypes as a
++    // nonstandard format.
++    if (uttype.dynamic || uttype.preferredMIMEType == nil) {
++      return false;
++    }
++    *result = base::SysNSStringToUTF8(uttype.preferredMIMEType);
++    return true;
++  }
++
++  base::apple::ScopedCFTypeRef<CFStringRef> ext_ref(
++      base::SysUTF8ToCFStringRef(ext_nodot));
++  if (!ext_ref) {
++    return false;
++  }
++  base::apple::ScopedCFTypeRef<CFStringRef> uti(
++      UTTypeCreatePreferredIdentifierForTag(kUTTagClassFilenameExtension,
++                                            ext_ref.get(),
++                                            /*inConformingToUTI=*/nullptr));
++  if (!uti) {
+     return false;
+   }
+-  *result = base::SysNSStringToUTF8(uttype.preferredMIMEType);
++  base::apple::ScopedCFTypeRef<CFStringRef> mime_ref(
++      UTTypeCopyPreferredTagWithClass(uti.get(), kUTTagClassMIMEType));
++  if (!mime_ref) {
++    return false;
++  }
++
++  *result = base::SysCFStringRefToUTF8(mime_ref.get());
+   return true;
+ }
+ 
+ bool PlatformMimeUtil::GetPlatformPreferredExtensionForMimeType(
+     std::string_view mime_type,
+     base::FilePath::StringType* ext) const {
+-  UTType* uttype = [UTType typeWithMIMEType:base::SysUTF8ToNSString(mime_type)];
+-  if (uttype.dynamic || uttype.preferredFilenameExtension == nil) {
++  if (@available(macOS 11, iOS 14, *)) {
++    UTType* uttype =
++        [UTType typeWithMIMEType:base::SysUTF8ToNSString(mime_type)];
++    if (uttype.dynamic || uttype.preferredFilenameExtension == nil) {
++      return false;
++    }
++    *ext = base::SysNSStringToUTF8(uttype.preferredFilenameExtension);
++    return true;
++  }
++
++  base::apple::ScopedCFTypeRef<CFStringRef> mime_ref(
++      base::SysUTF8ToCFStringRef(mime_type));
++  if (!mime_ref) {
+     return false;
+   }
+-  *ext = base::SysNSStringToUTF8(uttype.preferredFilenameExtension);
++  base::apple::ScopedCFTypeRef<CFStringRef> uti(
++      UTTypeCreatePreferredIdentifierForTag(kUTTagClassMIMEType, mime_ref.get(),
++                                            /*inConformingToUTI=*/nullptr));
++  if (!uti) {
++    return false;
++  }
++  base::apple::ScopedCFTypeRef<CFStringRef> ext_ref(
++      UTTypeCopyPreferredTagWithClass(uti.get(), kUTTagClassFilenameExtension));
++  if (!ext_ref) {
++    return false;
++  }
++
++  *ext = base::SysCFStringRefToUTF8(ext_ref.get());
+   return true;
+ }
+ 
+ void PlatformMimeUtil::GetPlatformExtensionsForMimeType(
+     std::string_view mime_type,
+     std::unordered_set<base::FilePath::StringType>* extensions) const {
+-  NSArray<UTType*>* types =
+-      [UTType typesWithTag:base::SysUTF8ToNSString(mime_type)
+-                  tagClass:UTTagClassMIMEType
+-          conformingToType:nil];
+   bool extensions_found = false;
+-  if (types) {
+-    for (UTType* type in types) {
+-      if (!type || type.preferredFilenameExtension == nil) {
+-        continue;
++  if (@available(macOS 11, iOS 14, *)) {
++    NSArray<UTType*>* types =
++        [UTType typesWithTag:base::SysUTF8ToNSString(mime_type)
++                    tagClass:UTTagClassMIMEType
++            conformingToType:nil];
++    if (types) {
++      for (UTType* type in types) {
++        if (!type || type.preferredFilenameExtension == nil) {
++          continue;
++        }
++        extensions_found = true;
++        NSArray<NSString*>* extensions_list =
++            type.tags[UTTagClassFilenameExtension];
++        for (NSString* extension in extensions_list) {
++          extensions->insert(base::SysNSStringToUTF8(extension));
++        }
+       }
+-      extensions_found = true;
+-      NSArray<NSString*>* extensions_list =
+-          type.tags[UTTagClassFilenameExtension];
+-      for (NSString* extension in extensions_list) {
+-        extensions->insert(base::SysNSStringToUTF8(extension));
++    }
++  } else {
++    base::apple::ScopedCFTypeRef<CFStringRef> mime_ref(
++        base::SysUTF8ToCFStringRef(mime_type));
++    base::apple::ScopedCFTypeRef<CFArrayRef> types;
++    if (mime_ref) {
++      types.reset(UTTypeCreateAllIdentifiersForTag(kUTTagClassMIMEType,
++                                                   mime_ref.get(), nullptr));
++    }
++    if (types) {
++      for (CFIndex i = 0; i < CFArrayGetCount(types.get()); i++) {
++        base::apple::ScopedCFTypeRef<CFArrayRef> extensions_list(
++            UTTypeCopyAllTagsWithClass(
++                base::apple::CFCast<CFStringRef>(
++                    CFArrayGetValueAtIndex(types.get(), i)),
++                kUTTagClassFilenameExtension));
++        if (!extensions_list) {
++          continue;
++        }
++        extensions_found = true;
++        for (NSString* extension in base::apple::CFToNSPtrCast(
++                 extensions_list.get())) {
++          extensions->insert(base::SysNSStringToUTF8(extension));
++        }
+       }
+     }
+   }
+diff --git a/net/socket/udp_socket_posix.cc b/net/socket/udp_socket_posix.cc
+index 68a5440692294bbe30f5d0e27cb85ca159b36229..16670ba03d9633b48e4f437f3b346cde1938d4b5 100644
+--- a/net/socket/udp_socket_posix.cc
++++ b/net/socket/udp_socket_posix.cc
+@@ -73,6 +73,10 @@
+ #include "net/socket/socket_apple.h"
+ #endif  // BUILDFLAG(IS_APPLE)
+ 
++#if BUILDFLAG(IS_MAC)
++#include "base/mac/mac_util.h"
++#endif  // BUILDFLAG(IS_MAC)
++
+ #if BUILDFLAG(IS_MAC)
+ #include <ifaddrs.h>
+ 
+@@ -754,7 +758,11 @@ int UDPSocketPosix::SetDoNotFragment() {
+ #if !defined(IP_PMTUDISC_DO) && !BUILDFLAG(IS_MAC)
+   return ERR_NOT_IMPLEMENTED;
+ 
++// setsockopt(IP_DONTFRAG) is supported on macOS from Big Sur
+ #elif BUILDFLAG(IS_MAC)
++  if (base::mac::MacOSMajorVersion() < 11) {
++    return ERR_NOT_IMPLEMENTED;
++  }
+   int val = 1;
+   if (addr_family_ == AF_INET6) {
+     int rv =
+diff --git a/net/ssl/client_cert_store_mac.cc b/net/ssl/client_cert_store_mac.cc
+index c92d91d72dd8f0933424dfdf594fdce380cfd141..ade86cc6429c344513e8ce9d7862fcd5074f5c22 100644
+--- a/net/ssl/client_cert_store_mac.cc
++++ b/net/ssl/client_cert_store_mac.cc
+@@ -80,8 +80,26 @@ OSStatus CopyCertChain(
+     // The return value is intentionally ignored since we only care about
+     // building a cert chain, not whether it is trusted (the server is the
+     // only one that can decide that.)
+-    std::ignore = SecTrustEvaluateWithError(trust.get(), nullptr);
+-    out_cert_chain->reset(SecTrustCopyCertificateChain(trust.get()));
++    if (__builtin_available(macOS 10.14, *)) {
++      std::ignore = SecTrustEvaluateWithError(trust.get(), nullptr);
++    } else {
++      SecTrustResultType trust_result;
++      std::ignore = SecTrustEvaluate(trust.get(), &trust_result);
++    }
++    if (__builtin_available(macOS 12.0, *)) {
++      out_cert_chain->reset(SecTrustCopyCertificateChain(trust.get()));
++    } else {
++      // SecTrustCopyCertificateChain() needs macOS 12.
++      CFIndex count = SecTrustGetCertificateCount(trust.get());
++      CFMutableArrayRef chain =
++          CFArrayCreateMutable(kCFAllocatorDefault, count,
++                               &kCFTypeArrayCallBacks);
++      for (CFIndex i = 0; i < count; ++i) {
++        CFArrayAppendValue(chain,
++                           SecTrustGetCertificateAtIndex(trust.get(), i));
++      }
++      out_cert_chain->reset(chain);
++    }
+   }
+   return result;
+ }
 diff --git a/rlz/mac/lib/machine_id_mac.cc b/rlz/mac/lib/machine_id_mac.cc
 index ab1e53b0bdb4a069fe85aa3198b8c3aeba553094..312f80a827a38d260206f7bfd9f05be95bf4c95d 100644
 --- a/rlz/mac/lib/machine_id_mac.cc
@@ -677,6 +2817,43 @@ index f3e840f2e8a8c3e45a91827abf266142cdb43440..db2a05ef958220dac0ee2cd3ce7dacc6
    if (!service.get()) {
      HID_LOG(DEBUG) << "IOService not found for ID: " << platform_device_id;
      return base::apple::ScopedCFTypeRef<IOHIDDeviceRef>();
+diff --git a/services/device/public/cpp/geolocation/location_manager_delegate.mm b/services/device/public/cpp/geolocation/location_manager_delegate.mm
+index 17982a2781319f8afdffe9bf3e998630db56b725..9fdbfea8fb73e25defb75e045f3e43948b7126d3 100644
+--- a/services/device/public/cpp/geolocation/location_manager_delegate.mm
++++ b/services/device/public/cpp/geolocation/location_manager_delegate.mm
+@@ -60,10 +60,11 @@ - (void)locationManager:(CLLocationManager*)manager
+   position.longitude = location.coordinate.longitude;
+   position.timestamp = base::Time::FromSecondsSinceUnixEpoch(
+       location.timestamp.timeIntervalSince1970);
++  position.altitude = location.altitude;
+   if (base::FeatureList::IsEnabled(features::kEllipsoidalAltitude)) {
+-    position.altitude = location.ellipsoidalAltitude;
+-  } else {
+-    position.altitude = location.altitude;
++    if (@available(macOS 12.0, *)) {
++      position.altitude = location.ellipsoidalAltitude;
++    }
+   }
+   position.accuracy = location.horizontalAccuracy;
+   position.altitude_accuracy = location.verticalAccuracy;
+diff --git a/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm b/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm
+index 1b71f49414a8d55381895e15494c518b3fced186..98d231e7f7b1258614606c02305bfcf387ed2ed0 100644
+--- a/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm
++++ b/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm
+@@ -209,7 +209,12 @@
+ }
+ 
+ void SystemGeolocationSourceApple::RequestPermission() {
+-  [location_manager_ requestWhenInUseAuthorization];
++  if (@available(macOS 10.15, *)) {
++    [location_manager_ requestWhenInUseAuthorization];
++  } else {
++    // Before macOS 10.15, starting location updates prompts for permission.
++    [location_manager_ startUpdatingLocation];
++  }
+ }
+ 
+ void SystemGeolocationSourceApple::AddPositionUpdateObserver(
 diff --git a/services/device/serial/serial_device_enumerator_mac.cc b/services/device/serial/serial_device_enumerator_mac.cc
 index 565065dd26b66cd56a66795cf64d73990a3f5730..80ae8589667b310e87495362c345a8b5b0000bfc 100644
 --- a/services/device/serial/serial_device_enumerator_mac.cc
@@ -703,6 +2880,94 @@ index bd2e65095a8de796e892c820d60298a8e4d13c71..33dd7c71ab5496b528c46cdaba594679
                                    IOServiceMatching("IOPlatformExpertDevice")));
    if (!platform_expert.get())
      return MachineIdStatus::FAILURE;
+diff --git a/services/shape_detection/barcode_detection_impl_mac_vision_api.mm b/services/shape_detection/barcode_detection_impl_mac_vision_api.mm
+index 119ab7a48b9f37f9b87e031fb78c2d536e80bc3f..85d508e8589d2be1945589af6175f5d87794b553 100644
+--- a/services/shape_detection/barcode_detection_impl_mac_vision_api.mm
++++ b/services/shape_detection/barcode_detection_impl_mac_vision_api.mm
+@@ -18,11 +18,19 @@
+   ~VisionAPI() override = default;
+ 
+   NSArray<VNBarcodeSymbology>* GetSupportedSymbologies() const override {
++    if (@available(macOS 12.0, *)) {
++    } else {
++      // -supportedSymbologiesAndReturnError: needs macOS 12.
++      return VNDetectBarcodesRequest.supportedSymbologies;
++    }
+     VNDetectBarcodesRequest* barcodes_request =
+         [[VNDetectBarcodesRequest alloc] init];
+     NSError* error = nil;
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+     NSArray<VNBarcodeSymbology>* symbologies =
+         [barcodes_request supportedSymbologiesAndReturnError:&error];
++#pragma clang diagnostic pop
+     if (error) {
+       DLOG(ERROR) << base::SysNSStringToUTF8(error.localizedDescription);
+     }
+diff --git a/services/webnn/coreml/tensor_impl_coreml.mm b/services/webnn/coreml/tensor_impl_coreml.mm
+index fd1499b1bb06e073f0d0c14bbdec4610db5aa114..29ee642ff7d3a1d618c0c2f42bb387621d7218d4 100644
+--- a/services/webnn/coreml/tensor_impl_coreml.mm
++++ b/services/webnn/coreml/tensor_impl_coreml.mm
+@@ -33,6 +33,12 @@
+ #include "services/webnn/queueable_resource_state.h"
+ #include "services/webnn/resource_task.h"
+ 
++// The CoreML backend is only created on macOS 14.4 and later (see
++// WebNNContextProviderImpl), so the newer CoreML APIs used here are not
++// checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace webnn::coreml {
+ 
+ namespace {
+@@ -465,3 +471,5 @@ MLMultiArrayDataType ToMLMultiArrayDataType(OperandDataType data_type) {
+ }
+ 
+ }  // namespace webnn::coreml
++
++#pragma clang diagnostic pop
+diff --git a/services/webnn/coreml/utils_coreml.mm b/services/webnn/coreml/utils_coreml.mm
+index c62359ff08ff2012ca404141fc9b191f85e4bd4c..ca631d21727eb31620cbbdd03d8b09e2804afb5f 100644
+--- a/services/webnn/coreml/utils_coreml.mm
++++ b/services/webnn/coreml/utils_coreml.mm
+@@ -19,6 +19,12 @@
+ #include "base/task/bind_post_task.h"
+ #include "mojo/public/cpp/base/big_buffer.h"
+ 
++// The CoreML backend is only created on macOS 14.4 and later (see
++// WebNNContextProviderImpl), so the newer CoreML APIs used here are not
++// checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace webnn::coreml {
+ 
+ namespace {
+@@ -179,3 +185,5 @@ void WriteToMLMultiArray(MLMultiArray* multi_array,
+ }
+ 
+ }  // namespace webnn::coreml
++
++#pragma clang diagnostic pop
+diff --git a/third_party/blink/renderer/core/editing/substring_util.mm b/third_party/blink/renderer/core/editing/substring_util.mm
+index 96e6780e071ffba7018a8fa04b1c8bee3bf939e7..2cf1547fe4bf1e1f6e71b6cc150c15cdd22eec67 100644
+--- a/third_party/blink/renderer/core/editing/substring_util.mm
++++ b/third_party/blink/renderer/core/editing/substring_util.mm
+@@ -121,7 +121,12 @@
+ 
+     NSFont* font = nil;
+     if (original_font) {
+-      font = [original_font fontWithSize:desired_size];
++      if (@available(macOS 10.15, *)) {
++        font = [original_font fontWithSize:desired_size];
++      } else {
++        font = [NSFont fontWithDescriptor:original_font.fontDescriptor
++                                     size:desired_size];
++      }
+     }
+ 
+     // If the platform font can't be loaded, or the size is incorrect comparing
 diff --git a/third_party/crashpad/crashpad/util/mac/mac_util.cc b/third_party/crashpad/crashpad/util/mac/mac_util.cc
 index 90666bb9cc31c719d25ce2bbc1e86752e08b3021..f76a5930212e17784261ebdd3510ded601f06ab4 100644
 --- a/third_party/crashpad/crashpad/util/mac/mac_util.cc
@@ -716,6 +2981,166 @@ index 90666bb9cc31c719d25ce2bbc1e86752e08b3021..f76a5930212e17784261ebdd3510ded6
                                    IOServiceMatching("IOPlatformExpertDevice")));
    if (platform_expert) {
      model->assign(IORegistryEntryDataPropertyAsString(platform_expert.get(),
+diff --git a/ui/accelerated_widget_mac/ca_renderer_layer_tree.mm b/ui/accelerated_widget_mac/ca_renderer_layer_tree.mm
+index 6cddc3dd739ba9c946eeed517ae936ee59640e80..447dd8a1dde471b60ac333cc1c1aa13037dbc112 100644
+--- a/ui/accelerated_widget_mac/ca_renderer_layer_tree.mm
++++ b/ui/accelerated_widget_mac/ca_renderer_layer_tree.mm
+@@ -177,10 +177,12 @@ bool AVSampleBufferDisplayLayerEnqueueIOSurface(
+                               kCVImageBufferTransferFunctionKey,
+                               kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+                               kCVAttachmentMode_ShouldPropagate);
+-        CVBufferSetAttachment(cv_pixel_buffer.get(),
+-                              kCVImageBufferAmbientViewingEnvironmentKey,
+-                              gfx::GenerateAmbientViewingEnvironment().get(),
+-                              kCVAttachmentMode_ShouldPropagate);
++        if (@available(macOS 12.0, *)) {
++          CVBufferSetAttachment(cv_pixel_buffer.get(),
++                                kCVImageBufferAmbientViewingEnvironmentKey,
++                                gfx::GenerateAmbientViewingEnvironment().get(),
++                                kCVAttachmentMode_ShouldPropagate);
++        }
+         break;
+       case gfx::ColorSpace::TransferID::PQ:
+         CVBufferSetAttachment(cv_pixel_buffer.get(),
+@@ -1128,8 +1130,10 @@ const auto av_rect(
+     update_opacity = old_layer_->opacity_ != opacity_;
+     update_ca_filter = old_layer_->ca_filter_ != ca_filter_;
+     if (type_ == CALayerType::kVideo) {
+-      av_layer_.preventsCapture =
+-          protected_video_type_ != gfx::ProtectedVideoType::kClear;
++      if (@available(macOS 10.15, *)) {
++        av_layer_.preventsCapture =
++            protected_video_type_ != gfx::ProtectedVideoType::kClear;
++      }
+     }
+   } else {
+     switch (type_) {
+@@ -1148,7 +1152,9 @@ const auto av_rect(
+         ca_layer_ = av_layer_;
+         av_layer_.videoGravity = AVLayerVideoGravityResize;
+         if (protected_video_type_ != gfx::ProtectedVideoType::kClear) {
+-          av_layer_.preventsCapture = true;
++          if (@available(macOS 10.15, *)) {
++            av_layer_.preventsCapture = true;
++          }
+         }
+         break;
+       case CALayerType::kDefault:
+diff --git a/ui/accessibility/platform/ax_platform_node_cocoa.mm b/ui/accessibility/platform/ax_platform_node_cocoa.mm
+index 188328f7492125ebb4304552a7f1aed079929b41..9e6f01464443b46b9e8ac6704708e4f3f47d49ea 100644
+--- a/ui/accessibility/platform/ax_platform_node_cocoa.mm
++++ b/ui/accessibility/platform/ax_platform_node_cocoa.mm
+@@ -3928,14 +3928,19 @@ - (NSArray*)accessibilityCustomContent {
+     return nil;
+   }
+ 
+-  NSString* description =
+-      [self getStringAttribute:ax::mojom::StringAttribute::kDescription];
+-  AXCustomContent* contentItem =
+-      [AXCustomContent customContentWithLabel:@"description" value:description];
+-  // A custom content importance of high causes it to be spoken
+-  // automatically, rather than "More content available".
+-  contentItem.importance = AXCustomContentImportanceHigh;
+-  return @[ contentItem ];
++  // AXCustomContent needs macOS 11.
++  if (@available(macOS 11.0, *)) {
++    NSString* description =
++        [self getStringAttribute:ax::mojom::StringAttribute::kDescription];
++    AXCustomContent* contentItem =
++        [AXCustomContent customContentWithLabel:@"description"
++                                          value:description];
++    // A custom content importance of high causes it to be spoken
++    // automatically, rather than "More content available".
++    contentItem.importance = AXCustomContentImportanceHigh;
++    return @[ contentItem ];
++  }
++  return nil;
+ }
+ 
+ // MathML attributes.
+diff --git a/ui/accessibility/platform/inspect/ax_call_statement_invoker_mac.mm b/ui/accessibility/platform/inspect/ax_call_statement_invoker_mac.mm
+index 5ab48958ac0971f2433885054272a17561d3042f..d5e54a46d92e747f28eb1b1bc4399713430692dd 100644
+--- a/ui/accessibility/platform/inspect/ax_call_statement_invoker_mac.mm
++++ b/ui/accessibility/platform/inspect/ax_call_statement_invoker_mac.mm
+@@ -15,6 +15,11 @@
+ #include "ui/accessibility/platform/inspect/ax_property_node.h"
+ #include "ui/gfx/native_ui_types.h"
+ 
++// AXCustomContent needs macOS 11. Before that the class is missing, so type
++// checks against it fail and no AXCustomContent objects are ever seen here.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace ui {
+ 
+ // Template specialization of AXOptional<id>::ToString().
+@@ -841,3 +846,5 @@
+ }
+ 
+ }  // namespace ui
++
++#pragma clang diagnostic pop
+diff --git a/ui/accessibility/platform/inspect/ax_element_wrapper_mac.mm b/ui/accessibility/platform/inspect/ax_element_wrapper_mac.mm
+index de7a40994a0b6dc94a097dd714747cdbff5ba2c3..b0b1e14ae4c04ee0723d82af3aa9f7186204225e 100644
+--- a/ui/accessibility/platform/inspect/ax_element_wrapper_mac.mm
++++ b/ui/accessibility/platform/inspect/ax_element_wrapper_mac.mm
+@@ -27,6 +27,11 @@
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+ 
++// AXCustomContent needs macOS 11. Before that the class is missing, so type
++// checks against it fail and no AXCustomContent objects are ever seen here.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace {
+ 
+ // AXUIElementCopyAttributeValue("AXCustomContent") returns an NSData
+@@ -484,3 +489,5 @@
+ }  // namespace ui
+ 
+ #pragma clang diagnostic pop
++
++#pragma clang diagnostic pop
+diff --git a/ui/accessibility/platform/inspect/ax_transform_mac.mm b/ui/accessibility/platform/inspect/ax_transform_mac.mm
+index bd2ccf8900db4ebc692680f33b10222827300242..a97c93d641016d10ca1b79e6acaf4cedf6c1b970 100644
+--- a/ui/accessibility/platform/inspect/ax_transform_mac.mm
++++ b/ui/accessibility/platform/inspect/ax_transform_mac.mm
+@@ -18,6 +18,11 @@
+ #include "ui/accessibility/platform/inspect/ax_element_wrapper_mac.h"
+ #include "ui/accessibility/platform/inspect/ax_inspect_utils.h"
+ 
++// AXCustomContent needs macOS 11. Before that the class is missing, so type
++// checks against it fail and no AXCustomContent objects are ever seen here.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace ui {
+ 
+ constexpr char kHeightDictKey[] = "h";
+@@ -321,3 +326,5 @@
+ }
+ 
+ }  // namespace ui
++
++#pragma clang diagnostic pop
+diff --git a/ui/base/accelerators/media_keys_listener_mac.mm b/ui/base/accelerators/media_keys_listener_mac.mm
+index 0627953a9f4e17135c2358fd73379bd9b31a4913..2656220620a0959847e47980238c6ab6e121e665 100644
+--- a/ui/base/accelerators/media_keys_listener_mac.mm
++++ b/ui/base/accelerators/media_keys_listener_mac.mm
+@@ -27,7 +27,11 @@
+ const int kSystemDefinedEventMediaKeysSubtype = 8;
+ 
+ IOHIDAccessType CheckPostEventAccess() {
+-  return IOHIDCheckAccess(kIOHIDRequestTypePostEvent);
++  if (@available(macOS 10.15, *)) {
++    return IOHIDCheckAccess(kIOHIDRequestTypePostEvent);
++  }
++  // There is no input monitoring permission before macOS 10.15.
++  return kIOHIDAccessTypeGranted;
+ }
+ 
+ KeyboardCode MediaKeyCodeToKeyboardCode(int key_code) {
 diff --git a/ui/base/clipboard/clipboard_format_type_mac.mm b/ui/base/clipboard/clipboard_format_type_mac.mm
 index 5e1b88236fe983850bd28d0b6325af5c8d517d93..39623a57e53a4cf3630446c664fd69a3bcf9f2d4 100644
 --- a/ui/base/clipboard/clipboard_format_type_mac.mm
@@ -730,26 +3155,255 @@ index 5e1b88236fe983850bd28d0b6325af5c8d517d93..39623a57e53a4cf3630446c664fd69a3
    return *type;
  }
  
+diff --git a/ui/base/clipboard/clipboard_util_mac.mm b/ui/base/clipboard/clipboard_util_mac.mm
+index fca159988567c4e60d5fe1756d538f7608063b57..1242815d9e7eefab6813eaf7cc8a7bd8b98b14dc 100644
+--- a/ui/base/clipboard/clipboard_util_mac.mm
++++ b/ui/base/clipboard/clipboard_util_mac.mm
+@@ -12,6 +12,7 @@
+ #include "base/apple/bridging.h"
+ #include "base/apple/foundation_util.h"
+ #include "base/files/file_path.h"
++#include "base/mac/uttype_compat.h"
+ #include "base/notreached.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "ui/base/clipboard/clipboard_constants.h"
+@@ -155,13 +156,11 @@ + (instancetype)URLAndTitleWithURL:(NSString*)url title:(NSString*)title {
+       // there is no official constant for that. However, that type does conform
+       // to the generic "internet location" type (aka .inetloc), so check for
+       // that.
+-      UTType* type;
+-      if (![file_url getResourceValue:&type
+-                               forKey:NSURLContentTypeKey
+-                                error:nil]) {
+-        return nil;
+-      }
+-      if (![type conformsToType:UTTypeInternetLocation]) {
++      // "com.apple.internet-location" is the identifier of
++      // UTTypeInternetLocation, which needs macOS 11.
++      if (!base::mac::UTTypeConformsTo(
++              base::mac::UTTypeIdentifierForFileURL(file_url),
++              @"com.apple.internet-location")) {
+         return nil;
+       }
+ 
+@@ -186,22 +185,22 @@ + (instancetype)URLAndTitleWithURL:(NSString*)url title:(NSString*)title {
+   }
+   NSURL* file_url = [NSURL URLWithString:file].filePathURL;
+ 
+-  NSDictionary* resource_values;
+-  resource_values =
+-      [file_url resourceValuesForKeys:@[ NSURLFileSizeKey, NSURLContentTypeKey ]
+-                                error:nil];
+-  if (!resource_values) {
++  NSNumber* file_size;
++  if (![file_url getResourceValue:&file_size
++                           forKey:NSURLFileSizeKey
++                            error:nil]) {
+     return nil;
+   }
+-
+-  NSNumber* file_size = resource_values[NSURLFileSizeKey];
+   if (file_size.unsignedLongValue >
+       clipboard_util::internal::kMaximumParsableFileSize) {
+     return nil;
+   }
+ 
+-  UTType* type = resource_values[NSURLContentTypeKey];
+-  if (![type conformsToType:UTTypeInternetShortcut]) {
++  // "com.microsoft.internet-shortcut" is the identifier of
++  // UTTypeInternetShortcut, which needs macOS 11.
++  if (!base::mac::UTTypeConformsTo(
++          base::mac::UTTypeIdentifierForFileURL(file_url),
++          @"com.microsoft.internet-shortcut")) {
+     return nil;
+   }
+ 
+diff --git a/ui/base/cocoa/appkit_utils.h b/ui/base/cocoa/appkit_utils.h
+index e7bc045ce6213e9096d7ccf5915903a74eea12ec..f393f3f36f204f05d94a10240c56fff830593e7f 100644
+--- a/ui/base/cocoa/appkit_utils.h
++++ b/ui/base/cocoa/appkit_utils.h
+@@ -47,13 +47,22 @@ COMPONENT_EXPORT(UI_BASE) bool PasteMightBlockWithPrivacyAlert();
+ // Converts a single string value of either a modern pasteboard type or an
+ // obsolete PBoard type to the corresponding UTType. Returns nil if nil is
+ // specified as the type, or if the type cannot be found.
+-COMPONENT_EXPORT(UI_BASE) UTType* UTTypeForServicesType(NSString* type);
++COMPONENT_EXPORT(UI_BASE)
++UTType* UTTypeForServicesType(NSString* type) API_AVAILABLE(macos(11.0));
+ 
+ // Converts an array of string values of either modern pasteboard types or
+ // obsolete PBoard types to a set of the corresponding UTType values. Invalid
+ // values are dropped, as NSArrays/NSSets cannot contain nils.
+ COMPONENT_EXPORT(UI_BASE)
+-NSSet<UTType*>* UTTypesForServicesTypeArray(NSArray* types);
++NSSet<UTType*>* UTTypesForServicesTypeArray(NSArray* types)
++    API_AVAILABLE(macos(11.0));
++
++// Like the functions above, but returning UTType identifiers, so that they
++// also work before macOS 11.
++COMPONENT_EXPORT(UI_BASE)
++NSString* UTTypeIdentifierForServicesType(NSString* type);
++COMPONENT_EXPORT(UI_BASE)
++NSSet<NSString*>* UTTypeIdentifiersForServicesTypeArray(NSArray* types);
+ #endif  // __OBJC__
+ 
+ }  // namespace ui
+diff --git a/ui/base/cocoa/appkit_utils.mm b/ui/base/cocoa/appkit_utils.mm
+index db406349c8c3930489103b1dabe0de33864c2c9b..c371f822a494ad3ac803960e9a784c8ec0e74b4c 100644
+--- a/ui/base/cocoa/appkit_utils.mm
++++ b/ui/base/cocoa/appkit_utils.mm
+@@ -5,10 +5,13 @@
+ #import "ui/base/cocoa/appkit_utils.h"
+ 
+ #import <Cocoa/Cocoa.h>
++#import <CoreServices/CoreServices.h>
+ #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+ 
+ #include <cmath>
+ 
++#include "base/apple/bridging.h"
++#include "base/apple/scoped_cftyperef.h"
+ #include "base/mac/mac_util.h"
+ #include "ui/base/resource/resource_bundle.h"
+ 
+@@ -81,4 +84,40 @@ bool PasteMightBlockWithPrivacyAlert() {
+   return result;
+ }
+ 
++NSString* UTTypeIdentifierForServicesType(NSString* type) {
++  if (@available(macOS 11.0, *)) {
++    return UTTypeForServicesType(type).identifier;
++  }
++  if (!type) {
++    return nil;
++  }
++
++  // Before macOS 11, use the Launch Services UTType functions, which
++  // UniformTypeIdentifiers replaced.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++  CFStringRef cf_type = base::apple::NSToCFPtrCast(type);
++  if (UTTypeIsDeclared(cf_type)) {
++    return type;
++  }
++  base::apple::ScopedCFTypeRef<CFStringRef> uti(
++      UTTypeCreatePreferredIdentifierForTag(CFSTR("com.apple.nspboard-type"),
++                                            cf_type, nullptr));
++  if (!uti || UTTypeIsDynamic(uti.get())) {
++    return nil;
++  }
++#pragma clang diagnostic pop
++  return base::apple::CFToNSOwnershipCast(uti.release());
++}
++
++NSSet<NSString*>* UTTypeIdentifiersForServicesTypeArray(NSArray* types) {
++  NSMutableSet* result = [NSMutableSet set];
++  for (NSString* type in types) {
++    if (NSString* identifier = UTTypeIdentifierForServicesType(type)) {
++      [result addObject:identifier];
++    }
++  }
++  return result;
++}
++
+ }  // namespace ui
+diff --git a/ui/base/cocoa/permissions_utils.mm b/ui/base/cocoa/permissions_utils.mm
+index a0e54fdbc815a76344156dbf10cbc7be167b821b..f899990e34314c8966c6350bbccc7d4371b4dc47 100644
+--- a/ui/base/cocoa/permissions_utils.mm
++++ b/ui/base/cocoa/permissions_utils.mm
+@@ -102,12 +102,19 @@ void CaptureScreenshot() {
+ 
+ }  // namespace
+ 
++// There is no screen recording permission before macOS 10.15.
+ bool IsScreenCaptureAllowed() {
++  if (@available(macOS 10.15, *)) {
+     return CGPreflightScreenCaptureAccess();
++  }
++  return true;
+ }
+ 
+ bool TryPromptUserForScreenCapture() {
++  if (@available(macOS 10.15, *)) {
+     return CGRequestScreenCaptureAccess();
++  }
++  return true;
+ }
+ 
+ void WarmScreenCapture() {
+diff --git a/ui/base/dragdrop/os_exchange_data_provider_mac.mm b/ui/base/dragdrop/os_exchange_data_provider_mac.mm
+index 352739f1da162433427edda5138e96fe353e0aa9..f505dff8bfac2ee270b1ca8710faa30f554c49e4 100644
+--- a/ui/base/dragdrop/os_exchange_data_provider_mac.mm
++++ b/ui/base/dragdrop/os_exchange_data_provider_mac.mm
+@@ -14,6 +14,7 @@
+ #include "base/apple/foundation_util.h"
+ #include "base/check_op.h"
+ #include "base/containers/span.h"
++#include "base/mac/uttype_compat.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/notimplemented.h"
+ #include "base/pickle.h"
+@@ -302,14 +303,13 @@ explicit WrappingProvider(NSPasteboard* pasteboard)
+ 
+   NSArray* types = [pboard types];
+   for (NSString* type in types) {
+-    UTType* utType = [UTType typeWithIdentifier:type];
+-    if ([utType conformsToType:UTTypeImage]) {
++    if (base::mac::UTTypeConformsTo(type, @"public.image")) {
+       NSData* data = [pboard dataForType:type];
+       if (data) {
+         base::span<const uint8_t> span = base::apple::NSDataToSpan(data);
+         std::vector<uint8_t> file_contents(span.begin(), span.end());
+         base::FilePath filename;
+-        NSString* ext = utType.preferredFilenameExtension;
++        NSString* ext = base::mac::UTTypePreferredFilenameExtension(type);
+         if (ext) {
+           filename = base::FilePath(base::SysNSStringToUTF8(ext));
+         }
+@@ -329,8 +329,7 @@ explicit WrappingProvider(NSPasteboard* pasteboard)
+ 
+   NSArray* types = [pboard types];
+   for (NSString* type in types) {
+-    UTType* utType = [UTType typeWithIdentifier:type];
+-    if ([utType conformsToType:UTTypeImage]) {
++    if (base::mac::UTTypeConformsTo(type, @"public.image")) {
+       return true;
+     }
+   }
 diff --git a/ui/color/mac/native_color_mixers_mac.mm b/ui/color/mac/native_color_mixers_mac.mm
-index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..eb36e4ddc8ec219d87f7f63fb5255c57fffbd203 100644
+index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..798802d6eaf0496f0d8359fe5693c9a3bb2ecddc 100644
 --- a/ui/color/mac/native_color_mixers_mac.mm
 +++ b/ui/color/mac/native_color_mixers_mac.mm
-@@ -55,6 +55,11 @@ AppearanceProperties AppearancePropertiesForKey(const ColorProviderKey& key) {
+@@ -55,17 +55,38 @@ AppearanceProperties AppearancePropertiesForKey(const ColorProviderKey& key) {
    // appearanceNamed:]` and yet this code does so. This yields the same
    // `NSAppearance` objects that result from passing the non-high contrast names
    // to -`appearanceNamed:`.
+-  if (properties.dark) {
+-    return [NSAppearance
+-        appearanceNamed:properties.high_contrast
+-                            ? NSAppearanceNameAccessibilityHighContrastDarkAqua
+-                            : NSAppearanceNameDarkAqua];
+-  } else {
+-    return [NSAppearance
+-        appearanceNamed:properties.high_contrast
+-                            ? NSAppearanceNameAccessibilityHighContrastAqua
+-                            : NSAppearanceNameAqua];
 +  if (@available(macOS 10.14, *)) {
-+  } else {
-+    // There is no dark or high contrast appearance before macOS 10.14.
-+    return [NSAppearance appearanceNamed:NSAppearanceNameAqua];
++    if (properties.dark) {
++      return [NSAppearance
++          appearanceNamed:properties.high_contrast
++                              ? NSAppearanceNameAccessibilityHighContrastDarkAqua
++                              : NSAppearanceNameDarkAqua];
++    } else {
++      return [NSAppearance
++          appearanceNamed:properties.high_contrast
++                              ? NSAppearanceNameAccessibilityHighContrastAqua
++                              : NSAppearanceNameAqua];
++    }
 +  }
-   if (properties.dark) {
-     return [NSAppearance
-         appearanceNamed:properties.high_contrast
-@@ -68,6 +73,23 @@ AppearanceProperties AppearancePropertiesForKey(const ColorProviderKey& key) {
-   }
- }
- 
++  // There is no dark or high contrast appearance before macOS 10.14.
++  return [NSAppearance appearanceNamed:NSAppearanceNameAqua];
++}
++
 +// -[NSAppearance performAsCurrentDrawingAppearance:] needs macOS 11. Before
 +// that, set the current appearance around the block instead.
 +void PerformAsCurrentDrawingAppearance(NSAppearance* appearance,
@@ -757,7 +3411,7 @@ index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..eb36e4ddc8ec219d87f7f63fb5255c57
 +  if (@available(macOS 11.0, *)) {
 +    [appearance performAsCurrentDrawingAppearance:block];
 +    return;
-+  }
+   }
 +#pragma clang diagnostic push
 +#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 +  NSAppearance* saved_appearance = NSAppearance.currentAppearance;
@@ -765,12 +3419,10 @@ index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..eb36e4ddc8ec219d87f7f63fb5255c57
 +  block();
 +  NSAppearance.currentAppearance = saved_appearance;
 +#pragma clang diagnostic pop
-+}
-+
+ }
+ 
  SkColor NSSystemColorToSkColor(NSColor* color) {
-   // It is expected that the colors that will flow through this function will be
-   // catalog colors. Being a catalog color means that it doesn't have explicit
-@@ -111,7 +133,7 @@ void AddNativeCoreColorMixer(ColorProvider* provider,
+@@ -111,7 +132,7 @@ void AddNativeCoreColorMixer(ColorProvider* provider,
          NSSystemColorToSkColor(NSColor.keyboardFocusIndicatorColor), 0x66)};
    };
  
@@ -779,7 +3431,7 @@ index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..eb36e4ddc8ec219d87f7f63fb5255c57
  }
  
  void AddNativeColorSetInColorMixer(ColorMixer& mixer) {
-@@ -131,8 +153,16 @@ void AddNativeUiColorMixer(ColorProvider* provider,
+@@ -131,8 +152,16 @@ void AddNativeUiColorMixer(ColorProvider* provider,
  
      AddNativeColorSetInColorMixer(mixer);
  
@@ -798,7 +3450,7 @@ index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..eb36e4ddc8ec219d87f7f63fb5255c57
      if (!key.user_color.has_value()) {
        mixer[kColorSysStateFocusRing] = PickGoogleColor(
            NSSystemColorToSkColor(NSColor.keyboardFocusIndicatorColor),
-@@ -160,7 +190,7 @@ void AddNativeUiColorMixer(ColorProvider* provider,
+@@ -160,7 +189,7 @@ void AddNativeUiColorMixer(ColorProvider* provider,
      mixer[kColorTableRowHighlight] = {kColorSysStateHoverOnSubtle};
    };
  
@@ -807,6 +3459,99 @@ index 6465ac5be199f326fef8d8cfb81e33fc148c9cc5..eb36e4ddc8ec219d87f7f63fb5255c57
  }
  
  void AddNativePostprocessingMixer(ColorProvider* provider,
+diff --git a/ui/display/mac/screen_mac.mm b/ui/display/mac/screen_mac.mm
+index 9121fc1f13219f2c1ee58f1806cedb7c6a83edb0..98b740d856da1f1378c781bb24a1bc79d01bb7b7 100644
+--- a/ui/display/mac/screen_mac.mm
++++ b/ui/display/mac/screen_mac.mm
+@@ -33,6 +33,7 @@
+ #include "ui/display/display.h"
+ #include "ui/display/display_change_notifier.h"
+ #include "ui/display/mac/screen_mac_headless.h"
++#include "ui/display/mac/screen_utils_mac.h"
+ #include "ui/display/util/display_util.h"
+ #include "ui/gfx/geometry/point.h"
+ #include "ui/gfx/icc_profile.h"
+@@ -113,8 +114,11 @@ DisplayMac BuildDisplayForScreen(NSScreen* screen) {
+   // Examine the presence of HDR.
+   bool enable_hdr = false;
+   float hdr_max_lum_relative = 1.f;
+-  const float max_potential_edr_value =
+-      screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
++  float max_potential_edr_value = 1.f;
++  if (@available(macOS 10.15, *)) {
++    max_potential_edr_value =
++        screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
++  }
+   const float max_edr_value =
+       screen.maximumExtendedDynamicRangeColorComponentValue;
+   if (max_potential_edr_value > 1.f) {
+@@ -195,9 +199,15 @@ DisplayMac BuildDisplayForScreen(NSScreen* screen) {
+   // Query the display's refresh rate. To get a float number such as 59.95Hz,
+   // use 1.0/screen.minimumRefreshInterval instead of
+   // screen.maximumFramesPerSecond, which is an integer.
+-  float refresh_rate = (screen.minimumRefreshInterval > 0)
+-                           ? (1.0 / screen.minimumRefreshInterval)
+-                           : screen.maximumFramesPerSecond;
++  float refresh_rate;
++  if (@available(macOS 12.0, *)) {
++    refresh_rate = (screen.minimumRefreshInterval > 0)
++                       ? (1.0 / screen.minimumRefreshInterval)
++                       : screen.maximumFramesPerSecond;
++  } else {
++    // NSScreen's refresh rate needs macOS 12.
++    refresh_rate = 1.0 / GetCGRefreshInterval(display_id).InSecondsF();
++  }
+   display.set_display_frequency(refresh_rate);
+ 
+   // CGDisplayRotation returns a double. Display::SetRotationAsDegree will
+@@ -210,7 +220,9 @@ DisplayMac BuildDisplayForScreen(NSScreen* screen) {
+     SetInternalDisplayIds({display_id});
+   }
+ 
+-  display.set_label(base::SysNSStringToUTF8(screen.localizedName));
++  if (@available(macOS 10.15, *)) {
++    display.set_label(base::SysNSStringToUTF8(screen.localizedName));
++  }
+ 
+   return DisplayMac{display, screen};
+ }
+diff --git a/ui/display/mac/screen_utils_mac.mm b/ui/display/mac/screen_utils_mac.mm
+index 7215ee02b2139223a79b76ad40150b8d957c835d..e4ef72b533b40ab2ca155dd280c3099c23bd0808 100644
+--- a/ui/display/mac/screen_utils_mac.mm
++++ b/ui/display/mac/screen_utils_mac.mm
+@@ -28,7 +28,12 @@
+   base::TimeDelta interval;
+ 
+   if (screen) {
+-    interval = base::Seconds(1) * screen.minimumRefreshInterval;
++    if (@available(macOS 12.0, *)) {
++      interval = base::Seconds(1) * screen.minimumRefreshInterval;
++    } else {
++      // NSScreen's refresh intervals need macOS 12.
++      interval = GetCGRefreshInterval(display_id);
++    }
+   }
+ 
+   // For ExternalDisplayLinkMac, we start to use a display link before it's
+@@ -49,9 +54,15 @@ void GetNSScreenRefreshIntervalRange(CGDirectDisplayID display_id,
+   NSScreen* screen = GetNSScreenFromDisplayID(display_id);
+ 
+   if (screen) {
+-    min_interval = base::Seconds(1) * screen.minimumRefreshInterval;
+-    max_interval = base::Seconds(1) * screen.maximumRefreshInterval;
+-    granularity = base::Seconds(1) * screen.displayUpdateGranularity;
++    if (@available(macOS 12.0, *)) {
++      min_interval = base::Seconds(1) * screen.minimumRefreshInterval;
++      max_interval = base::Seconds(1) * screen.maximumRefreshInterval;
++      granularity = base::Seconds(1) * screen.displayUpdateGranularity;
++    } else {
++      // NSScreen's refresh intervals need macOS 12.
++      min_interval = max_interval = granularity =
++          GetCGRefreshInterval(display_id);
++    }
+   } else {
+     min_interval = max_interval = granularity = base::Seconds(1) / 60.0;
+   }
 diff --git a/ui/gfx/mac/color_space_util.mm b/ui/gfx/mac/color_space_util.mm
 index 5e2ffd82a29c98b88eeb4d796cdca5ac577f153a..e0f0b9f68979704377e174b2bca1271e727e2ad5 100644
 --- a/ui/gfx/mac/color_space_util.mm
@@ -903,3 +3648,79 @@ index cb98e2debec7e3ea192ae3280db1070e2e06aadb..5f0d155167ba73df994b1149893e83ba
  }  // namespace gfx
 +
 +#pragma clang diagnostic pop
+diff --git a/ui/gl/gl_display.h b/ui/gl/gl_display.h
+index dcf4d2c29ae419cc0a3e007da7d27c7a3ae4893e..d9325181245a642e2f1eda42ba294fd8570b69da 100644
+--- a/ui/gl/gl_display.h
++++ b/ui/gl/gl_display.h
+@@ -22,6 +22,12 @@
+ #endif  // __OBJC__
+ #endif
+ 
++// MTLSharedEvent needs macOS 10.14. Shared events only come from ANGLE's
++// Metal backend or Dawn, which are not used on older releases, so the uses
++// here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace gl {
+ struct DisplayExtensionsEGL;
+ template <typename GLDisplayPlatform>
+@@ -200,4 +206,6 @@ class GL_EXPORT GLDisplayEGL : public GLDisplay {
+ 
+ }  // namespace gl
+ 
++#pragma clang diagnostic pop
++
+ #endif  // UI_GL_GL_DISPLAY_H_
+diff --git a/ui/gl/gl_display_egl.mm b/ui/gl/gl_display_egl.mm
+index 30c5f867ac3558d4722676c45a949923bbc19453..d008409b9e73ec1b6712b90d61894b0de6589ccf 100644
+--- a/ui/gl/gl_display_egl.mm
++++ b/ui/gl/gl_display_egl.mm
+@@ -19,6 +19,12 @@
+ #define EGL_SYNC_METAL_SHARED_EVENT_SIGNALED_ANGLE 0x34DC
+ #endif
+ 
++// MTLSharedEvent needs macOS 10.14. Shared events only come from ANGLE's
++// Metal backend or Dawn, which are not used on older releases, so the uses
++// here are not checked individually.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++
+ namespace gl {
+ 
+ struct GLDisplayEGL::ObjCStorage {
+@@ -167,3 +173,5 @@
+ }
+ 
+ }  // namespace gl
++
++#pragma clang diagnostic pop
+diff --git a/ui/native_theme/os_settings_provider_mac.mm b/ui/native_theme/os_settings_provider_mac.mm
+index 2f22d35cfcb361e67193bb8a759d093832bcca8c..7a08388c9730ece9438e5055f616c9b7681b5f86 100644
+--- a/ui/native_theme/os_settings_provider_mac.mm
++++ b/ui/native_theme/os_settings_provider_mac.mm
+@@ -98,13 +98,17 @@ - (void)observeValueForKeyPath:(NSString*)forKeyPath
+ 
+ NativeTheme::PreferredColorScheme OsSettingsProviderMac::PreferredColorScheme()
+     const {
+-  NSAppearanceName appearance =
+-      [NSApp.effectiveAppearance bestMatchFromAppearancesWithNames:@[
+-        NSAppearanceNameAqua, NSAppearanceNameDarkAqua
+-      ]];
+-  return [appearance isEqual:NSAppearanceNameDarkAqua]
+-             ? NativeTheme::PreferredColorScheme::kDark
+-             : NativeTheme::PreferredColorScheme::kLight;
++  // There is no dark appearance before macOS 10.14.
++  if (@available(macOS 10.14, *)) {
++    NSAppearanceName appearance =
++        [NSApp.effectiveAppearance bestMatchFromAppearancesWithNames:@[
++          NSAppearanceNameAqua, NSAppearanceNameDarkAqua
++        ]];
++    return [appearance isEqual:NSAppearanceNameDarkAqua]
++               ? NativeTheme::PreferredColorScheme::kDark
++               : NativeTheme::PreferredColorScheme::kLight;
++  }
++  return NativeTheme::PreferredColorScheme::kLight;
+ }
+ 
+ NativeTheme::PreferredContrast OsSettingsProviderMac::PreferredContrast()

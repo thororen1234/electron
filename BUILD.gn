@@ -1338,6 +1338,18 @@ if (is_mac) {
 
       # Required for exporting all symbols of libuv.
       "-Wl,-force_load,obj/third_party/electron_node/deps/uv/libuv.a",
+
+      # These frameworks are newer than the oldest supported macOS version
+      # and are linked strongly by Chromium. Weak-link them so the framework
+      # still loads on older releases, where their APIs are only used behind
+      # availability checks.
+      "-Wl,-weak_framework,AuthenticationServices",
+      "-Wl,-weak_framework,CoreHaptics",
+      "-Wl,-weak_framework,LocalAuthenticationEmbeddedUI",
+      "-Wl,-weak_framework,Network",
+      "-Wl,-weak_framework,ScreenCaptureKit",
+      "-Wl,-weak_framework,UniformTypeIdentifiers",
+      "-Wl,-weak_framework,UserNotifications",
     ]
     if (is_component_build) {
       ldflags += [
