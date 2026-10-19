@@ -1,1 +1,2 @@
 fix_resolve_getsystemtimepreciseasfiletime_at_runtime_on_windows.patch
+fix_use_posix_memalign_for_aligned_allocation_before_macos_10_15.patch

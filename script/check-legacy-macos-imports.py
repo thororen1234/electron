@@ -233,7 +233,11 @@ def load_system_library(path):
 
 def has_symbol(handle, symbol):
   # Mach-O symbol names carry a leading underscore that dlsym() adds itself.
-  name = symbol[1:] if symbol.startswith('_') else symbol
+  # Names without one, such as dyld_stub_binder (which libdyld has provided
+  # for lazy binding on every macOS release), can't be looked up with dlsym().
+  if not symbol.startswith('_'):
+    return True
+  name = symbol[1:]
   try:
     handle[name]
     return True

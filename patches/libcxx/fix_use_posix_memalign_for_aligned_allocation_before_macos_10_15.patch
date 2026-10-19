@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 23:31:28 -0400
+Subject: fix: use posix_memalign() for aligned allocation before macOS 10.15
+
+aligned_alloc() only exists from macOS 10.15. libc++ calls it for aligned
+operator new, and its headers are system headers, so the unguarded call
+isn't diagnosed and it is weak-imported as a null function on older
+releases. Use posix_memalign() when targeting earlier macOS versions.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/src/include/aligned_alloc.h b/src/include/aligned_alloc.h
+index 24ca26ce0452547b9692de49c3aae6958aaa0dfd..4ea5b28fc9c1533ffc6c42b04fdcb456ac9b7f59 100644
+--- a/src/include/aligned_alloc.h
++++ b/src/include/aligned_alloc.h
+@@ -30,6 +30,13 @@ inline _LIBCPP_HIDE_FROM_ABI void* __libcpp_aligned_alloc(std::size_t __alignmen
+ #  if defined(_LIBCPP_MSVCRT_LIKE)
+   return ::_aligned_malloc(__size, __alignment);
+ 
++// aligned_alloc() only exists from macOS 10.15.
++#  elif defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 101500
++  void* __result = nullptr;
++  (void)::posix_memalign(&__result, __alignment < sizeof(void*) ? sizeof(void*) : __alignment, __size);
++  // If posix_memalign fails, __result is unmodified so we still return `nullptr`.
++  return __result;
++
+ // Android only provides aligned_alloc when targeting API 28 or higher.
+ #  elif !defined(__ANDROID__) || __ANDROID_API__ >= 28
+   // aligned_alloc() requires that __size is a multiple of __alignment,

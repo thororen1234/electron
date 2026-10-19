@@ -56,6 +56,12 @@ kern.osproductversion only exists from macOS 10.13.4, so derive the macOS
 version from the Darwin version before that. setsockopt(IP_DONTFRAG) is
 only used on macOS 11 and later again.
 
+responsibility_spawnattrs_setdisclaim() and
+CGFontRenderingGetFontSmoothingDisabled() only exist from macOS 10.14 and
+are declared without availability information, so weak-import them and
+check for them. Do the same for the identity token functions crashpad
+calls behind macOS 11.3 checks, which the SDK doesn't annotate either.
+
 This patch is needed for macOS 10.13 support and is not suitable for
 upstreaming.
 
@@ -498,10 +504,22 @@ index fe865bd0500a1ae4f894ee3bc105ac2dbc80543f..3d7d226aa20a0a01b9578c6b809f28fd
      LOG(ERROR) << "Could not create a notification port";
      return false;
 diff --git a/base/process/launch_mac.cc b/base/process/launch_mac.cc
-index 2f86e619a4441c0d290834da431931216426bf3e..97c951a7691a698fe93e26d3987018747f699ab3 100644
+index 2f86e619a4441c0d290834da431931216426bf3e..80d4d9934e171d71fd2f9927b7afd219c0f848b0 100644
 --- a/base/process/launch_mac.cc
 +++ b/base/process/launch_mac.cc
-@@ -165,7 +165,7 @@ class PosixSpawnFileActions {
+@@ -103,8 +103,10 @@ int pthread_chdir_np(const char* dir);
+ int pthread_fchdir_np(int fd);
+ #endif
+ 
++// Only exists from macOS 10.14, so it is weak-imported and checked for.
+ int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t attrs,
+-                                          int disclaim);
++                                          int disclaim)
++    __attribute__((weak_import));
+ }  // extern "C"
+ 
+ namespace base {
+@@ -165,7 +167,7 @@ class PosixSpawnFileActions {
    }
  
  #if BUILDFLAG(IS_MAC)
@@ -510,7 +528,7 @@ index 2f86e619a4441c0d290834da431931216426bf3e..97c951a7691a698fe93e26d398701874
      if (__builtin_available(macOS 26, *)) {
        DPSXCHECK(posix_spawn_file_actions_addchdir(&file_actions_, path));
      } else {
-@@ -180,7 +180,6 @@ class PosixSpawnFileActions {
+@@ -180,7 +182,6 @@ class PosixSpawnFileActions {
    posix_spawn_file_actions_t file_actions_;
  };
  
@@ -518,7 +536,7 @@ index 2f86e619a4441c0d290834da431931216426bf3e..97c951a7691a698fe93e26d398701874
  int ChangeCurrentThreadDirectory(const char* path) {
  #if IS_MAS_BUILD()
    #pragma clang diagnostic push
-@@ -204,7 +203,6 @@ int ResetCurrentThreadDirectory() {
+@@ -204,7 +205,6 @@ int ResetCurrentThreadDirectory() {
    return pthread_fchdir_np(-1);
  #endif
  }
@@ -526,7 +544,16 @@ index 2f86e619a4441c0d290834da431931216426bf3e..97c951a7691a698fe93e26d398701874
  
  struct GetAppOutputOptions {
    // Whether to pipe stderr to stdout in |output|.
-@@ -367,23 +365,31 @@ Process LaunchProcess(const std::vector<std::string>& argv,
+@@ -327,7 +327,7 @@ Process LaunchProcess(const std::vector<std::string>& argv,
+   }
+ 
+ #if !IS_MAS_BUILD()
+-  if (options.disclaim_responsibility) {
++  if (options.disclaim_responsibility && responsibility_spawnattrs_setdisclaim) {
+     DPSXCHECK(responsibility_spawnattrs_setdisclaim(attr.get(), 1));
+   }
+ #endif
+@@ -367,23 +367,31 @@ Process LaunchProcess(const std::vector<std::string>& argv,
                                      : argv_cstr[0];
  
    if (options.enable_cpu_security_mitigations) {
@@ -569,7 +596,7 @@ index 2f86e619a4441c0d290834da431931216426bf3e..97c951a7691a698fe93e26d398701874
    }
  
    int rv;
-@@ -453,12 +459,10 @@ Process LaunchProcess(const std::vector<std::string>& argv,
+@@ -453,12 +461,10 @@ Process LaunchProcess(const std::vector<std::string>& argv,
  #endif
    }
  
@@ -1734,6 +1761,31 @@ index 56e65e7e79d889c93148e5407f307aa976b9fd6a..84f31a053a60b8b2828ea782996cfdeb
        }
      }
  
+diff --git a/content/renderer/theme_helper_mac.mm b/content/renderer/theme_helper_mac.mm
+index 1ff781c49f086ec8015c7d3c44567dbec3d00ff8..df69b5beaa52a851cc1d8dbf31561391aa284db9 100644
+--- a/content/renderer/theme_helper_mac.mm
++++ b/content/renderer/theme_helper_mac.mm
+@@ -11,7 +11,8 @@
+ 
+ #if !IS_MAS_BUILD()
+ extern "C" {
+-bool CGFontRenderingGetFontSmoothingDisabled(void);
++// Only exists from macOS 10.14, so it is weak-imported and checked for.
++bool CGFontRenderingGetFontSmoothingDisabled(void) __attribute__((weak_import));
+ }
+ #endif
+ namespace content {
+@@ -19,6 +20,10 @@
+ bool IsSubpixelAntialiasingAvailable() {
+ #if !IS_MAS_BUILD()
+   // See https://trac.webkit.org/changeset/239306/webkit for more info.
++  // Subpixel antialiasing can't be turned off before macOS 10.14.
++  if (!CGFontRenderingGetFontSmoothingDisabled) {
++    return true;
++  }
+   return !CGFontRenderingGetFontSmoothingDisabled();
+ #else
+   NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
 diff --git a/crypto/apple/unexportable_key_apple.mm b/crypto/apple/unexportable_key_apple.mm
 index 365706f7b536c59f65be3272c79f428bdc5941c1..95d735f8477dff520baf925049b3de4320bf9038 100644
 --- a/crypto/apple/unexportable_key_apple.mm
@@ -2981,6 +3033,40 @@ index 90666bb9cc31c719d25ce2bbc1e86752e08b3021..f76a5930212e17784261ebdd3510ded6
                                    IOServiceMatching("IOPlatformExpertDevice")));
    if (platform_expert) {
      model->assign(IORegistryEntryDataPropertyAsString(platform_expert.get(),
+diff --git a/third_party/crashpad/crashpad/util/mach/exc_client_variants.cc b/third_party/crashpad/crashpad/util/mach/exc_client_variants.cc
+index e5c803037ee2a32d1d384a892bd397909303e334..2f89181a8d5e0a7e71bfd996587c939947b0c946 100644
+--- a/third_party/crashpad/crashpad/util/mach/exc_client_variants.cc
++++ b/third_party/crashpad/crashpad/util/mach/exc_client_variants.cc
+@@ -22,6 +22,12 @@
+ #include "util/mach/exc.h"
+ #include "util/mach/mach_exc.h"
+ 
++// The SDK headers don't mark these as macOS 11.3 APIs, so references to them
++// would be strong and keep crashpad from loading on older releases. They are
++// only called behind availability checks.
++#pragma weak task_create_identity_token
++#pragma weak task_identity_token_get_task_port
++
+ namespace crashpad {
+ 
+ kern_return_t UniversalExceptionRaise(exception_behavior_t behavior,
+diff --git a/third_party/crashpad/crashpad/util/mach/exc_server_variants.cc b/third_party/crashpad/crashpad/util/mach/exc_server_variants.cc
+index c4a62e09bf2a9a255215a289ad89c39e4c8343ad..315e4e924ed6b08e7771960f091a30b33ca9ed0e 100644
+--- a/third_party/crashpad/crashpad/util/mach/exc_server_variants.cc
++++ b/third_party/crashpad/crashpad/util/mach/exc_server_variants.cc
+@@ -38,6 +38,12 @@
+ #include "base/apple/mach_logging.h"
+ #endif
+ 
++// The SDK headers don't mark these as macOS 11.3 APIs, so references to them
++// would be strong and keep crashpad from loading on older releases. They are
++// only called behind availability checks.
++#pragma weak task_create_identity_token
++#pragma weak task_identity_token_get_task_port
++
+ namespace crashpad {
+ 
+ namespace {
 diff --git a/ui/accelerated_widget_mac/ca_renderer_layer_tree.mm b/ui/accelerated_widget_mac/ca_renderer_layer_tree.mm
 index 6cddc3dd739ba9c946eeed517ae936ee59640e80..447dd8a1dde471b60ac333cc1c1aa13037dbc112 100644
 --- a/ui/accelerated_widget_mac/ca_renderer_layer_tree.mm
