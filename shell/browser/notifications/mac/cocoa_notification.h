@@ -13,6 +13,12 @@
 
 #include "shell/browser/notifications/notification.h"
 
+// The User Notifications framework needs macOS 10.14. This is only used on
+// macOS 10.14 and later (see NotificationPresenter::Create()), so its uses
+// are not checked individually.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
 namespace electron {
 
 class CocoaNotification : public Notification {
@@ -44,5 +50,7 @@ class CocoaNotification : public Notification {
 };
 
 }  // namespace electron
+
+#pragma clang diagnostic pop
 
 #endif  // ELECTRON_SHELL_BROWSER_NOTIFICATIONS_MAC_COCOA_NOTIFICATION_H_

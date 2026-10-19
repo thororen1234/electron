@@ -20,6 +20,12 @@
 
 #import <UserNotifications/UserNotifications.h>
 
+// UNNotificationResponse needs macOS 10.14. Launch notifications are only
+// UNNotificationResponse objects on macOS 10.14 and later, and are
+// NSUserNotification objects before that.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
 static NSDictionary* UNNotificationResponseToNSDictionary(
     UNNotificationResponse* response) {
   if (![response respondsToSelector:@selector(actionIdentifier)] ||
@@ -218,3 +224,5 @@ static NSDictionary* UNNotificationResponseToNSDictionary(
 }
 
 @end
+
+#pragma clang diagnostic pop

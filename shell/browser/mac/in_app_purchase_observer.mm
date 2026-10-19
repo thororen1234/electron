@@ -98,7 +98,7 @@ using InAppTransactionCallback = base::RepeatingCallback<void(
  * @param paymentDiscount - The SKPaymentDiscount object to convert.
  */
 - (in_app_purchase::PaymentDiscount)skPaymentDiscountToStruct:
-    (SKPaymentDiscount*)paymentDiscount {
+    (SKPaymentDiscount*)paymentDiscount API_AVAILABLE(macosx(10.14.4)) {
   in_app_purchase::PaymentDiscount paymentDiscountStruct;
 
   paymentDiscountStruct.identifier =
@@ -136,9 +136,11 @@ using InAppTransactionCallback = base::RepeatingCallback<void(
         base::SysNSStringToUTF8(payment.applicationUsername);
   }
 
-  if (payment.paymentDiscount != nil) {
-    paymentStruct.paymentDiscount =
-        [self skPaymentDiscountToStruct:payment.paymentDiscount];
+  if (@available(macOS 10.14.4, *)) {
+    if (payment.paymentDiscount != nil) {
+      paymentStruct.paymentDiscount =
+          [self skPaymentDiscountToStruct:payment.paymentDiscount];
+    }
   }
 
   return paymentStruct;

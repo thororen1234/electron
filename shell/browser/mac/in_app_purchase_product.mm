@@ -112,7 +112,8 @@
  */
 - (in_app_purchase::ProductSubscriptionPeriod)
     skProductSubscriptionPeriodToStruct:
-        (SKProductSubscriptionPeriod*)productSubscriptionPeriod {
+        (SKProductSubscriptionPeriod*)productSubscriptionPeriod
+    API_AVAILABLE(macosx(10.13.2)) {
   in_app_purchase::ProductSubscriptionPeriod productSubscriptionPeriodStruct;
 
   productSubscriptionPeriodStruct.numberOfUnits =
@@ -137,7 +138,7 @@
  * @param productDiscount - The SKProductDiscount object to convert.
  */
 - (in_app_purchase::ProductDiscount)skProductDiscountToStruct:
-    (SKProductDiscount*)productDiscount {
+    (SKProductDiscount*)productDiscount API_AVAILABLE(macosx(10.13.2)) {
   in_app_purchase::ProductDiscount productDiscountStruct;
 
   if (productDiscount.paymentMode == SKProductDiscountPaymentModePayAsYouGo) {
@@ -163,9 +164,11 @@
         skProductSubscriptionPeriodToStruct:productDiscount.subscriptionPeriod];
   }
 
-  productDiscountStruct.type = (int)productDiscount.type;
-  productDiscountStruct.identifier =
-      base::SysNSStringToUTF8(productDiscount.identifier);
+  if (@available(macOS 10.14.4, *)) {
+    productDiscountStruct.type = (int)productDiscount.type;
+    productDiscountStruct.identifier =
+        base::SysNSStringToUTF8(productDiscount.identifier);
+  }
   productDiscountStruct.price = [productDiscount.price doubleValue];
 
   return productDiscountStruct;
@@ -204,24 +207,30 @@
     }
   }
 
-  if (product.introductoryPrice != nil) {
-    productStruct.introductoryPrice =
-        [self skProductDiscountToStruct:product.introductoryPrice];
+  if (@available(macOS 10.13.2, *)) {
+    if (product.introductoryPrice != nil) {
+      productStruct.introductoryPrice =
+          [self skProductDiscountToStruct:product.introductoryPrice];
+    }
+    if (product.subscriptionPeriod != nil) {
+      productStruct.subscriptionPeriod =
+          [self skProductSubscriptionPeriodToStruct:product.subscriptionPeriod];
+    }
   }
-  if (product.subscriptionPeriod != nil) {
-    productStruct.subscriptionPeriod =
-        [self skProductSubscriptionPeriodToStruct:product.subscriptionPeriod];
+
+  if (@available(macOS 10.14, *)) {
+    productStruct.subscriptionGroupIdentifier =
+        base::SysNSStringToUTF8(product.subscriptionGroupIdentifier);
   }
 
-  productStruct.subscriptionGroupIdentifier =
-      base::SysNSStringToUTF8(product.subscriptionGroupIdentifier);
+  if (@available(macOS 10.14.4, *)) {
+    if (product.discounts != nil) {
+      productStruct.discounts.reserve([product.discounts count]);
 
-  if (product.discounts != nil) {
-    productStruct.discounts.reserve([product.discounts count]);
-
-    for (SKProductDiscount* discount in product.discounts) {
-      productStruct.discounts.push_back(
-          [self skProductDiscountToStruct:discount]);
+      for (SKProductDiscount* discount in product.discounts) {
+        productStruct.discounts.push_back(
+            [self skProductDiscountToStruct:discount]);
+      }
     }
   }
 
@@ -233,14 +242,25 @@
   // fields of Electron's Product structure.
   productStruct.isDownloadable = [product isDownloadable];
 
+  // downloadContentVersion and downloadContentLengths need macOS 10.14, and
+  // replaced contentVersion and contentLengths.
+  NSString* content_version;
+  NSArray<NSNumber*>* content_lengths;
+  if (@available(macOS 10.14, *)) {
+    content_version = product.downloadContentVersion;
+    content_lengths = product.downloadContentLengths;
+  } else {
+    content_version = product.contentVersion;
+    content_lengths = product.contentLengths;
+  }
+
   productStruct.downloadContentVersion =
-      base::SysNSStringToUTF8(product.downloadContentVersion);
+      base::SysNSStringToUTF8(content_version);
 
-  if (product.downloadContentLengths != nil) {
-    productStruct.downloadContentLengths.reserve(
-        [product.downloadContentLengths count]);
+  if (content_lengths != nil) {
+    productStruct.downloadContentLengths.reserve([content_lengths count]);
 
-    for (NSNumber* contentLength in product.downloadContentLengths) {
+    for (NSNumber* contentLength in content_lengths) {
       productStruct.downloadContentLengths.push_back(
           [contentLength longLongValue]);
     }

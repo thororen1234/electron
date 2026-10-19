@@ -24,6 +24,12 @@
 #import <AppKit/AppKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+// The User Notifications framework needs macOS 10.14. This is only used on
+// macOS 10.14 and later (see NotificationPresenter::Create()), so its uses
+// are not checked individually.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
 namespace electron {
 
 CocoaNotification::CocoaNotification(NotificationDelegate* delegate,
@@ -313,3 +319,5 @@ void CocoaNotification::LogAction(const char* action) {
 }
 
 }  // namespace electron
+
+#pragma clang diagnostic pop

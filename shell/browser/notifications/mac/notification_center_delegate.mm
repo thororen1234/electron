@@ -12,6 +12,12 @@
 #include "shell/browser/notifications/mac/cocoa_notification.h"
 #include "shell/browser/notifications/mac/notification_presenter_mac.h"
 
+// The User Notifications framework needs macOS 10.14. This is only used on
+// macOS 10.14 and later (see NotificationPresenter::Create()), so its uses
+// are not checked individually.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+
 @implementation NotificationCenterDelegate
 
 - (instancetype)initWithPresenter:
@@ -83,3 +89,5 @@
 }
 
 @end
+
+#pragma clang diagnostic pop

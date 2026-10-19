@@ -19,7 +19,14 @@ v8::Local<v8::Promise> PushNotifications::RegisterForAPNSNotifications(
   gin_helper::Promise<std::string> promise(isolate);
   v8::Local<v8::Promise> handle = promise.GetHandle();
 
-  [[AtomApplication sharedApplication] registerForRemoteNotifications];
+  if (@available(macOS 10.14, *)) {
+    [[AtomApplication sharedApplication] registerForRemoteNotifications];
+  } else {
+    [[AtomApplication sharedApplication]
+        registerForRemoteNotificationTypes:NSRemoteNotificationTypeAlert |
+                                           NSRemoteNotificationTypeBadge |
+                                           NSRemoteNotificationTypeSound];
+  }
 
   PushNotifications::apns_promise_set_.emplace_back(std::move(promise));
   return handle;

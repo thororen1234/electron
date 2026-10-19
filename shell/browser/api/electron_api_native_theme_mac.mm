@@ -13,7 +13,13 @@ void NativeTheme::UpdateMacOSAppearanceForOverrideValue(
   NSAppearance* new_appearance;
   switch (override) {
     case ui::NativeTheme::ThemeSource::kForcedDark:
-      new_appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+      // There is no dark appearance before macOS 10.14.
+      if (@available(macOS 10.14, *)) {
+        new_appearance =
+            [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+      } else {
+        new_appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+      }
       break;
     case ui::NativeTheme::ThemeSource::kForcedLight:
       new_appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];

@@ -12,7 +12,9 @@
 #import <QuickLook/QuickLook.h>
 #import <QuickLookThumbnailing/QuickLookThumbnailing.h>
 
+#include "base/apple/bridging.h"
 #include "base/apple/foundation_util.h"
+#include "base/apple/scoped_cftyperef.h"
 #include "base/strings/sys_string_conversions.h"
 #include "base/task/bind_post_task.h"
 #include "base/values.h"
@@ -49,7 +51,7 @@ double safeShift(double in, double def) {
 void ReceivedThumbnailResult(CGSize size,
                              gin_helper::Promise<gfx::Image> p,
                              QLThumbnailRepresentation* thumbnail,
-                             NSError* error) {
+                             NSError* error) API_AVAILABLE(macos(10.15)) {
   if (error || !thumbnail) {
     std::string err_msg = base::SysNSStringToUTF8(error.localizedDescription);
     p.RejectWithErrorMessage("unable to retrieve thumbnail preview "
@@ -90,27 +92,73 @@ v8::Local<v8::Promise> NativeImage::CreateThumbnailFromPath(
     return handle;
   }
 
-  NSScreen* screen = [[NSScreen screens] firstObject];
-  QLThumbnailGenerationRequest* request([[QLThumbnailGenerationRequest alloc]
-        initWithFileAtURL:nsurl
-                     size:cg_size
-                    scale:[screen backingScaleFactor]
-      representationTypes:QLThumbnailGenerationRequestRepresentationTypeAll]);
+  if (@available(macOS 10.15, *)) {
+    NSScreen* screen = [[NSScreen screens] firstObject];
+    QLThumbnailGenerationRequest* request([[QLThumbnailGenerationRequest alloc]
+          initWithFileAtURL:nsurl
+                       size:cg_size
+                      scale:[screen backingScaleFactor]
+        representationTypes:QLThumbnailGenerationRequestRepresentationTypeAll]);
+    __block auto block_callback = base::BindPostTaskToCurrentDefault(
+        base::BindOnce(&ReceivedThumbnailResult, cg_size, std::move(promise)));
+    auto completionHandler =
+        ^(QLThumbnailRepresentation* thumbnail, NSError* error) {
+          std::move(block_callback).Run(thumbnail, error);
+        };
+    [[QLThumbnailGenerator sharedGenerator]
+        generateBestRepresentationForRequest:request
+                           completionHandler:completionHandler];
+    return handle;
+  }
+
+  // QuickLookThumbnailing needs macOS 10.15. Before that, use the QuickLook
+  // thumbnail API it replaced, without blocking the main thread.
+  base::apple::ScopedCFTypeRef<QLThumbnailRef> ql_thumbnail(QLThumbnailCreate(
+      kCFAllocatorDefault, base::apple::NSToCFPtrCast(nsurl), cg_size,
+      nullptr));
+  if (!ql_thumbnail) {
+    promise.RejectWithErrorMessage(
+        "unable to retrieve thumbnail preview image for the given path");
+    return handle;
+  }
   __block auto block_callback = base::BindPostTaskToCurrentDefault(
-      base::BindOnce(&ReceivedThumbnailResult, cg_size, std::move(promise)));
-  auto completionHandler =
-      ^(QLThumbnailRepresentation* thumbnail, NSError* error) {
-        std::move(block_callback).Run(thumbnail, error);
-      };
-  [[QLThumbnailGenerator sharedGenerator]
-      generateBestRepresentationForRequest:request
-                         completionHandler:completionHandler];
+      base::BindOnce(
+          [](CGSize size, gin_helper::Promise<gfx::Image> p,
+             base::apple::ScopedCFTypeRef<CGImageRef> cg_thumbnail) {
+            if (!cg_thumbnail) {
+              p.RejectWithErrorMessage(
+                  "unable to retrieve thumbnail preview image for the given "
+                  "path");
+              return;
+            }
+            NSImage* result =
+                [[NSImage alloc] initWithCGImage:cg_thumbnail.get() size:size];
+            p.Resolve(gfx::Image(result));
+          },
+          cg_size, std::move(promise)));
+  QLThumbnailRef thumbnail_ref = ql_thumbnail.get();
+  CFRetain(thumbnail_ref);
+  QLThumbnailDispatchAsync(
+      thumbnail_ref,
+      dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, /*flags=*/0), ^{
+        base::apple::ScopedCFTypeRef<QLThumbnailRef> thumbnail(thumbnail_ref);
+        std::move(block_callback)
+            .Run(base::apple::ScopedCFTypeRef<CGImageRef>(
+                QLThumbnailCopyImage(thumbnail.get())));
+      });
 
   return handle;
 }
 
 NativeImage* NativeImage::CreateMenuSymbol(gin::Arguments* args,
                                            std::string name) {
+  // SF Symbols need macOS 11.
+  if (@available(macOS 11.0, *)) {
+  } else {
+    return CreateEmpty(args->isolate());
+  }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
   @autoreleasepool {
     NSImage* image =
         [NSImage imageWithSystemSymbolName:base::SysUTF8ToNSString(name)
@@ -158,10 +206,15 @@ NativeImage* NativeImage::CreateMenuSymbol(gin::Arguments* args,
 
     return sized;
   }
+#pragma clang diagnostic pop
 }
 
 NativeImage* NativeImage::CreateFromNamedImage(gin::Arguments* args,
                                                std::string name) {
+  // NSImageSymbolScale values are plain integers, so using them before macOS 11
+  // is fine. The SF Symbols APIs themselves are checked below.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
   @autoreleasepool {
     static bool deprecated_warning_issued = false;
 
@@ -245,15 +298,18 @@ NativeImage* NativeImage::CreateFromNamedImage(gin::Arguments* args,
 
     // Treat non-Cocoa-prefixed names as SF Symbols first.
     if (!base::StartsWith(name, "NS") && !base::StartsWith(name, "NX")) {
-      image = [NSImage imageWithSystemSymbolName:ns_name
-                        accessibilityDescription:nil];
+      // SF Symbols need macOS 11.
+      if (@available(macOS 11.0, *)) {
+        image = [NSImage imageWithSystemSymbolName:ns_name
+                          accessibilityDescription:nil];
 
-      NSImageSymbolConfiguration* symbol_config =
-          [NSImageSymbolConfiguration configurationWithPointSize:pointSize
-                                                          weight:weight
-                                                           scale:scale];
+        NSImageSymbolConfiguration* symbol_config =
+            [NSImageSymbolConfiguration configurationWithPointSize:pointSize
+                                                            weight:weight
+                                                             scale:scale];
 
-      image = [image imageWithSymbolConfiguration:symbol_config];
+        image = [image imageWithSymbolConfiguration:symbol_config];
+      }
     } else {
       image = [NSImage imageNamed:ns_name];
     }
@@ -279,6 +335,7 @@ NativeImage* NativeImage::CreateFromNamedImage(gin::Arguments* args,
     return CreateFromPNG(args->isolate(),
                          electron::util::as_byte_span(png_data));
   }
+#pragma clang diagnostic pop
 }
 
 void NativeImage::SetTemplateImage(bool setAsTemplate) {

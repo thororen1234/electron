@@ -13,13 +13,23 @@
 #include "base/task/sequenced_task_runner.h"
 #include "base/task/thread_pool.h"
 #include "shell/browser/notifications/mac/cocoa_notification.h"
+#include "shell/browser/notifications/mac/legacy_notification_presenter_mac.h"
 #include "shell/browser/notifications/mac/notification_center_delegate.h"
+
+// The User Notifications framework needs macOS 10.14. NotificationPresenterMac
+// is only created on macOS 10.14 and later, so its uses are not checked
+// individually.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
 
 namespace electron {
 
 // static
 std::unique_ptr<NotificationPresenter> NotificationPresenter::Create() {
-  return std::make_unique<NotificationPresenterMac>();
+  if (@available(macOS 10.14, *)) {
+    return std::make_unique<NotificationPresenterMac>();
+  }
+  return std::make_unique<LegacyNotificationPresenterMac>();
 }
 
 CocoaNotification* NotificationPresenterMac::GetNotification(
@@ -154,3 +164,5 @@ void NotificationPresenterMac::RemoveDeliveredNotificationsByGroupId(
 }
 
 }  // namespace electron
+
+#pragma clang diagnostic pop
