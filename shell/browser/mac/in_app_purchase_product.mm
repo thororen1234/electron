@@ -240,7 +240,11 @@
   // These hosted content properties are deprecated as of macOS 13 ("Hosted
   // content is no longer supported."), but they still back the documented
   // fields of Electron's Product structure.
-  productStruct.isDownloadable = [product isDownloadable];
+  if (@available(macOS 10.15, *)) {
+    productStruct.isDownloadable = [product isDownloadable];
+  } else {
+    productStruct.isDownloadable = [product downloadable];
+  }
 
   // downloadContentVersion and downloadContentLengths need macOS 10.14, and
   // replaced contentVersion and contentLengths.
