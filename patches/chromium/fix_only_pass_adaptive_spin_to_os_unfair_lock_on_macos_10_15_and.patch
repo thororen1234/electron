@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thororen <78185467+thororen1234@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:38:20 -0400
+Subject: fix: only pass adaptive spin to os_unfair_lock on macOS 10.15 and
+ later
+
+PartitionAlloc's SpinningMutex locks with
+os_unfair_lock_lock_with_options() and OS_UNFAIR_LOCK_ADAPTIVE_SPIN when
+the function exists. The function exists on macOS 10.13, but the option
+only from 10.15, and libplatform crashes with SIGILL on options it
+doesn't know, so the first contended allocation crashed the app there.
+Use plain os_unfair_lock_lock() before macOS 10.15.
+
+This patch is needed for macOS 10.13 support and is not suitable for
+upstreaming.
+
+diff --git a/base/allocator/partition_allocator/src/partition_alloc/spinning_mutex.cc b/base/allocator/partition_allocator/src/partition_alloc/spinning_mutex.cc
+index a54caf4183b244c82412dd4223caffac968611c0..1e4a7a1dd8e34bb6314c028e9f07092707ffa9bb 100644
+--- a/base/allocator/partition_allocator/src/partition_alloc/spinning_mutex.cc
++++ b/base/allocator/partition_allocator/src/partition_alloc/spinning_mutex.cc
+@@ -316,14 +316,20 @@ os_unfair_lock_lock_with_options(os_unfair_lock* lock,
+ }
+ 
+ void SpinningMutex::LockSlow() {
+-  if (os_unfair_lock_lock_with_options) {
+-    const os_unfair_lock_options_t options =
+-        static_cast<os_unfair_lock_options_t>(
+-            OS_UNFAIR_LOCK_DATA_SYNCHRONIZATION | OS_UNFAIR_LOCK_ADAPTIVE_SPIN);
+-    os_unfair_lock_lock_with_options(&unfair_lock_, options);
+-  } else {
+-    os_unfair_lock_lock(&unfair_lock_);
++  // OS_UNFAIR_LOCK_ADAPTIVE_SPIN only exists from macOS 10.15, and older
++  // releases crash on options they don't know, even though
++  // os_unfair_lock_lock_with_options() itself exists there.
++  if (__builtin_available(macOS 10.15, iOS 13, *)) {
++    if (os_unfair_lock_lock_with_options) {
++      const os_unfair_lock_options_t options =
++          static_cast<os_unfair_lock_options_t>(
++              OS_UNFAIR_LOCK_DATA_SYNCHRONIZATION |
++              OS_UNFAIR_LOCK_ADAPTIVE_SPIN);
++      os_unfair_lock_lock_with_options(&unfair_lock_, options);
++      return;
++    }
+   }
++  os_unfair_lock_lock(&unfair_lock_);
+ }
+ 
+ #elif PA_BUILDFLAG(IS_POSIX)
