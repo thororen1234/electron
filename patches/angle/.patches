@@ -1,4 +1,3 @@
-cherry-pick-82f9e7ef45.patch
 cherry-pick-99f12d73e0.patch
 cherry-pick-fca5efdfef.patch
 cherry-pick-651089f2f5.patch
@@ -14,8 +13,6 @@ cherry-pick-a1962ac29d86.patch
 cherry-pick-a5804ada06ac.patch
 cherry-pick-d299c51cfc12.patch
 cherry-pick-40b709be4f1f.patch
-cherry-pick-4a004f775637.patch
-cherry-pick-e80dc914f6c6.patch
 cherry-pick-0a35d208b1a4.patch
 cherry-pick-803dfde1e22e.patch
 cherry-pick-ac048ffcee48.patch
@@ -27,3 +24,23 @@ cherry-pick-ad72ad15e2c8.patch
 cherry-pick-7c4ce32df88b.patch
 fix_use_mach_port_null_for_the_default_iokit_port.patch
 build_support_a_macos_10_13_deployment_target_in_angle.patch
+cherry-pick-cccf60cde32c.patch
+cherry-pick-67691470653a.patch
+cherry-pick-48a16bd63d2d.patch
+cherry-pick-386bb0e11d39.patch
+cherry-pick-dfeede58b618.patch
+cherry-pick-d219c4f45f93.patch
+cherry-pick-97941c8fa290.patch
+cherry-pick-bea9f5ec4d25.patch
+cherry-pick-3adcc064145b.patch
+cherry-pick-e1d22eff1e8f.patch
+cherry-pick-b5bab166e6a7.patch
+cherry-pick-0b43596f5117.patch
+cherry-pick-8988bdf12f3b.patch
+cherry-pick-1efffc95e07e.patch
+cherry-pick-5448925bdda3.patch
+cherry-pick-71141e1e11e3.patch
+cherry-pick-3b30b49c041f.patch
+cherry-pick-2c5e2a5229a7.patch
+cherry-pick-906ad3fd3071.patch
+cherry-pick-5cbd3b1344b5.patch

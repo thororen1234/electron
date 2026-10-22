@@ -72,7 +72,6 @@
 #include "printing/buildflags/buildflags.h"
 #include "sandbox/policy/switches.h"
 #include "services/device/public/cpp/geolocation/geolocation_system_permission_manager.h"
-#include "services/device/public/cpp/geolocation/location_provider.h"
 #include "services/network/public/cpp/features.h"
 #include "services/network/public/cpp/is_potentially_trustworthy.h"
 #include "services/network/public/cpp/network_switches.h"
@@ -164,10 +163,6 @@
 #include "chrome/browser/spellchecker/spell_check_initialization_host_impl.h"  // nogncheck
 #include "components/spellcheck/common/spellcheck.mojom.h"  // nogncheck
 #endif
-
-#if BUILDFLAG(OVERRIDE_LOCATION_PROVIDER)
-#include "shell/browser/fake_location_provider.h"
-#endif  // BUILDFLAG(OVERRIDE_LOCATION_PROVIDER)
 
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
 #include "base/functional/bind.h"
@@ -960,15 +955,6 @@ ElectronBrowserClient::CreateClientCertStore(
 #endif
 }
 
-std::unique_ptr<device::LocationProvider>
-ElectronBrowserClient::OverrideSystemLocationProvider() {
-#if BUILDFLAG(OVERRIDE_LOCATION_PROVIDER)
-  return std::make_unique<FakeLocationProvider>();
-#else
-  return {};
-#endif
-}
-
 void ElectronBrowserClient::ConfigureNetworkContextParams(
     content::BrowserContext* browser_context,
     bool in_memory,
@@ -1433,7 +1419,9 @@ void ElectronBrowserClient::RegisterNonNetworkSubresourceURLLoaderFactories(
     factories->emplace(content::kChromeUIScheme,
                        content::CreateWebUIURLLoaderFactory(
                            frame_host, content::kChromeUIScheme,
-                           {content::kChromeUIResourcesHost}));
+                           {content::kChromeUIResourcesHost},
+                           request_initiator_origin.value_or(
+                               frame_host->GetLastCommittedOrigin())));
   }
 
   // Extensions with the necessary permissions get access to file:// URLs that
